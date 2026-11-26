@@ -96,6 +96,7 @@ export function ExportModal({
               <span>文件名 <b>{result.fileName}</b></span>
               <span>文件大小 <b>{formatSize(result.blob.size)}</b></span>
               <span>输出分辨率 <b>{result.width}×{result.height}</b></span>
+              <span>导出范围 <b>{result.clippedToSec !== null ? `前 ${result.clippedToSec} 秒片段` : '完整视频'}</b></span>
               <span>总帧数 <b>{result.frameCount} 帧</b></span>
               <span>总耗时 <b>{result.elapsedSec.toFixed(2)} s</b></span>
               <span>平均速度 <b>{result.avgFps.toFixed(1)} fps</b></span>
