@@ -55,6 +55,8 @@ type PlanStep = CachedDispatch | CachedCopy;
 interface FrameWorkspace {
   srcW: number;
   srcH: number;
+  workW: number;
+  workH: number;
   padW: number;
   padH: number;
   srPadW: number;
@@ -934,15 +936,17 @@ export class CodecSREngine {
   private ensureWorkspace(
     srcW: number,
     srcH: number,
+    workW: number,
+    workH: number,
     baked: BakedSsboResult,
     fast: PackedFastWeights,
   ): FrameWorkspace {
-    const padW = srcW + (srcW & 1);
-    const padH = srcH + (srcH & 1);
+    const padW = workW + (workW & 1);
+    const padH = workH + (workH & 1);
     const srPadW = Math.round(padW * baked.scalars.scale);
     const srPadH = Math.round(padH * baked.scalars.scale);
-    const outW = Math.round(srcW * baked.scalars.scale);
-    const outH = Math.round(srcH * baked.scalars.scale);
+    const outW = Math.round(workW * baked.scalars.scale);
+    const outH = Math.round(workH * baked.scalars.scale);
     const scratchBytes = computeRequiredScratchBytes(padH, padW, srPadH, srPadW, baked);
     const sig = this.getModelSignature(baked);
 
@@ -950,6 +954,8 @@ export class CodecSREngine {
       this.workspace &&
       this.workspace.srcW === srcW &&
       this.workspace.srcH === srcH &&
+      this.workspace.workW === workW &&
+      this.workspace.workH === workH &&
       this.workspace.outW === outW &&
       this.workspace.outH === outH &&
       this.workspace.scratchBytes >= scratchBytes
@@ -981,7 +987,7 @@ export class CodecSREngine {
 
     if (scratchBytes > this.device.limits.maxStorageBufferBindingSize) {
       throw new Error(
-        `当前视频分辨率 (${srcW}×${srcH}) 在此档位下所需显存缓冲 (${Math.round(scratchBytes / 1048576)} MB) 超出设备单 Buffer 上限 (${Math.round(this.device.limits.maxStorageBufferBindingSize / 1048576)} MB)，请切换 Client-L/S 或降低输入分辨率。`,
+        `当前工作分辨率 (${workW}×${workH}) 在此档位下所需显存缓冲 (${Math.round(scratchBytes / 1048576)} MB) 超出设备单 Buffer 上限 (${Math.round(this.device.limits.maxStorageBufferBindingSize / 1048576)} MB)，请切换「流畅 720p/540p」模式或使用 Client-L/S 档位。`,
       );
     }
 
@@ -1033,23 +1039,32 @@ export class CodecSREngine {
     const pongBuf = mkBuf('pong', scratchBytes);
 
     const rgb2yUniform = this.device.createBuffer({
-      size: 16,
+      size: 32,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
-    this.device.queue.writeBuffer(rgb2yUniform, 0, new Uint32Array([srcW, srcH, padW, padH]));
+    this.device.queue.writeBuffer(
+      rgb2yUniform,
+      0,
+      new Uint32Array([srcW, srcH, workW, workH, padW, padH, 0, 0]),
+    );
 
     const y2rgbUniform = this.device.createBuffer({
-      size: 16,
+      size: 32,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
-    this.device.queue.writeBuffer(y2rgbUniform, 0, new Uint32Array([outW, outH, srPadW, 0]));
+    this.device.queue.writeBuffer(
+      y2rgbUniform,
+      0,
+      new Uint32Array([outW, outH, srPadW, srcW, srcH, 0, 0, 0]),
+    );
 
     const rgb2yBindGroup = this.device.createBindGroup({
       layout: this.rgb2yPipeline.getBindGroupLayout(0),
       entries: [
         { binding: 0, resource: srcTex.createView() },
-        { binding: 1, resource: { buffer: xBuf } },
-        { binding: 2, resource: { buffer: rgb2yUniform } },
+        { binding: 1, resource: this.linearSampler },
+        { binding: 2, resource: { buffer: xBuf } },
+        { binding: 3, resource: { buffer: rgb2yUniform } },
       ],
     });
 
@@ -1117,6 +1132,8 @@ export class CodecSREngine {
     this.workspace = {
       srcW,
       srcH,
+      workW,
+      workH,
       padW,
       padH,
       srPadW,
@@ -1196,11 +1213,14 @@ export class CodecSREngine {
     srcH: number,
     includeBicubic = true,
     renderTarget?: { ctx: GPUCanvasContext; opts: DisplayOptions },
+    targetWorkSize?: { workW: number; workH: number },
   ): { outW: number; outH: number } {
     if (!this.activeBaked || !this.activeFastWeights || !this.weightBuf) {
       throw new Error('模型尚未初始化');
     }
-    const ws = this.ensureWorkspace(srcW, srcH, this.activeBaked, this.activeFastWeights);
+    const workW = targetWorkSize?.workW ?? srcW;
+    const workH = targetWorkSize?.workH ?? srcH;
+    const ws = this.ensureWorkspace(srcW, srcH, workW, workH, this.activeBaked, this.activeFastWeights);
 
     this.uploadExternalSource(source, ws.srcTex, srcW, srcH);
 

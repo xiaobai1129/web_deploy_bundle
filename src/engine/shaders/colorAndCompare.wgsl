@@ -1,24 +1,41 @@
 // RGB <-> Full-Range BT.601 YCbCr compute kernels + Split-Screen / Heatmap display shader
+// Supports GPU working-resolution scaling (for >720p mobile/4K uploads) and Keys Bicubic chroma upsampling.
 
 struct RgbToYParams {
   src_w: u32,
   src_h: u32,
+  work_w: u32,
+  work_h: u32,
   pad_w: u32,
   pad_h: u32,
+  _pad0: u32,
+  _pad1: u32,
 };
 
 @group(0) @binding(0) var src_rgb_tex: texture_2d<f32>;
-@group(0) @binding(1) var<storage, read_write> dst_y_buf: array<f32>;
-@group(0) @binding(2) var<uniform> rgb2y_u: RgbToYParams;
+@group(0) @binding(1) var rgb2y_sampler: sampler;
+@group(0) @binding(2) var<storage, read_write> dst_y_buf: array<f32>;
+@group(0) @binding(3) var<uniform> rgb2y_u: RgbToYParams;
 
 @compute @workgroup_size(16, 16, 1)
 fn rgb_to_y_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (gid.x >= rgb2y_u.pad_w || gid.y >= rgb2y_u.pad_h) {
     return;
   }
-  let cx = min(gid.x, rgb2y_u.src_w - 1u);
-  let cy = min(gid.y, rgb2y_u.src_h - 1u);
-  let rgb = textureLoad(src_rgb_tex, vec2<i32>(i32(cx), i32(cy)), 0).rgb;
+  let wx = min(gid.x, rgb2y_u.work_w - 1u);
+  let wy = min(gid.y, rgb2y_u.work_h - 1u);
+
+  var rgb: vec3<f32>;
+  if (rgb2y_u.work_w == rgb2y_u.src_w && rgb2y_u.work_h == rgb2y_u.src_h) {
+    rgb = textureLoad(src_rgb_tex, vec2<i32>(i32(wx), i32(wy)), 0).rgb;
+  } else {
+    let uv = vec2<f32>(
+      (f32(wx) + 0.5) / f32(rgb2y_u.work_w),
+      (f32(wy) + 0.5) / f32(rgb2y_u.work_h),
+    );
+    rgb = textureSampleLevel(src_rgb_tex, rgb2y_sampler, uv, 0.0).rgb;
+  }
+
   let y = 0.299 * rgb.r + 0.587 * rgb.g + 0.114 * rgb.b;
   dst_y_buf[gid.y * rgb2y_u.pad_w + gid.x] = clamp(y, 0.0, 1.0);
 }
@@ -27,7 +44,11 @@ struct YcbcrToRgbParams {
   out_w: u32,
   out_h: u32,
   y_stride: u32,
+  src_w: u32,
+  src_h: u32,
   _pad0: u32,
+  _pad1: u32,
+  _pad2: u32,
 };
 
 @group(0) @binding(0) var<storage, read> in_y_buf: array<f32>;
@@ -36,18 +57,54 @@ struct YcbcrToRgbParams {
 @group(0) @binding(3) var dst_rgba_tex: texture_storage_2d<rgba8unorm, write>;
 @group(0) @binding(4) var<uniform> y2rgb_u: YcbcrToRgbParams;
 
+fn chroma_cubic_w(t: f32) -> f32 {
+  let x = abs(t);
+  let a = -0.75;
+  if (x <= 1.0) {
+    return ((a + 2.0) * x - (a + 3.0)) * x * x + 1.0;
+  } else if (x < 2.0) {
+    return ((a * x - 5.0 * a) * x + 8.0 * a) * x - 4.0 * a;
+  }
+  return 0.0;
+}
+
 @compute @workgroup_size(16, 16, 1)
 fn ycbcr_to_rgba_main(@builtin(global_invocation_id) gid: vec3<u32>) {
   if (gid.x >= y2rgb_u.out_w || gid.y >= y2rgb_u.out_h) {
     return;
   }
-  let uv = vec2<f32>(
-    (f32(gid.x) + 0.5) / f32(y2rgb_u.out_w),
-    (f32(gid.y) + 0.5) / f32(y2rgb_u.out_h),
-  );
-  let rgb_lr = textureSampleLevel(chroma_src_tex, linear_sampler, uv, 0.0).rgb;
-  let cb = -0.168736 * rgb_lr.r - 0.331264 * rgb_lr.g + 0.5 * rgb_lr.b + 0.5;
-  let cr =  0.5 * rgb_lr.r - 0.418688 * rgb_lr.g - 0.081312 * rgb_lr.b + 0.5;
+
+  var rgb_chroma: vec3<f32>;
+  if (y2rgb_u.out_w > y2rgb_u.src_w || y2rgb_u.out_h > y2rgb_u.src_h) {
+    // Keys Bicubic (a=-0.75) chroma upsampling prevents bilinear color bleed on crisp colored text/edges
+    let sw = i32(y2rgb_u.src_w);
+    let sh = i32(y2rgb_u.src_h);
+    let sx = (f32(gid.x) + 0.5) * (f32(sw) / f32(y2rgb_u.out_w)) - 0.5;
+    let sy = (f32(gid.y) + 0.5) * (f32(sh) / f32(y2rgb_u.out_h)) - 0.5;
+    let ix0 = i32(floor(sx));
+    let iy0 = i32(floor(sy));
+
+    var acc = vec3<f32>(0.0);
+    for (var dy: i32 = -1; dy <= 2; dy = dy + 1) {
+      let ry = clamp(iy0 + dy, 0, sh - 1);
+      let wy = chroma_cubic_w(sy - f32(iy0 + dy));
+      for (var dx: i32 = -1; dx <= 2; dx = dx + 1) {
+        let rx = clamp(ix0 + dx, 0, sw - 1);
+        let wx = chroma_cubic_w(sx - f32(ix0 + dx));
+        acc = fma(vec3<f32>(wy * wx), textureLoad(chroma_src_tex, vec2<i32>(rx, ry), 0).rgb, acc);
+      }
+    }
+    rgb_chroma = clamp(acc, vec3<f32>(0.0), vec3<f32>(1.0));
+  } else {
+    let uv = vec2<f32>(
+      (f32(gid.x) + 0.5) / f32(y2rgb_u.out_w),
+      (f32(gid.y) + 0.5) / f32(y2rgb_u.out_h),
+    );
+    rgb_chroma = textureSampleLevel(chroma_src_tex, linear_sampler, uv, 0.0).rgb;
+  }
+
+  let cb = -0.168736 * rgb_chroma.r - 0.331264 * rgb_chroma.g + 0.5 * rgb_chroma.b + 0.5;
+  let cr =  0.5 * rgb_chroma.r - 0.418688 * rgb_chroma.g - 0.081312 * rgb_chroma.b + 0.5;
 
   let y_val = in_y_buf[gid.y * y2rgb_u.y_stride + gid.x];
   let r = clamp(y_val + 1.402 * (cr - 0.5), 0.0, 1.0);
