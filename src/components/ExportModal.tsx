@@ -40,7 +40,7 @@ export function ExportModal({
         <div className="modal-header">
           <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
             <Film size={18} color="#38bdf8" />
-            <h3>{exporting ? '正在本地 WebGPU 导出超分 MP4' : result ? '超分 MP4 导出完成' : '导出状态'}</h3>
+            <h3>{exporting ? '正在本地导出超分视频' : result ? '超分视频已就绪' : '导出状态'}</h3>
           </div>
           {!exporting && (
             <button className="btn btn-icon" onClick={onClose} aria-label="关闭">
@@ -52,19 +52,19 @@ export function ExportModal({
         {error && <div className="error-box">{error}</div>}
 
         {exporting && progress && (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
             <div className="field-row">
-              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-                <Loader2 size={14} /> {progress.message}
+              <span style={{ display: 'inline-flex', alignItems: 'center', gap: 7, color: 'var(--text-primary)' }}>
+                <Loader2 size={15} className="spin" color="#38bdf8" /> {progress.message}
               </span>
               <strong>{pct}%</strong>
             </div>
             <div className="progress-track">
               <div className="progress-fill" style={{ width: `${pct}%` }} />
             </div>
-            <div className="field-row" style={{ fontSize: 11 }}>
-              <span>处理速度: <strong>{progress.fps.toFixed(1)} fps</strong></span>
-              <span>预计剩余: <strong>{progress.etaSec.toFixed(1)} s</strong></span>
+            <div className="field-row" style={{ fontSize: 12 }}>
+              <span>处理速度 <strong>{progress.fps.toFixed(1)} fps</strong></span>
+              <span>预计剩余 <strong>{progress.etaSec.toFixed(1)} 秒</strong></span>
             </div>
             <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 4 }}>
               <button className="btn btn-danger" onClick={onCancel}>
@@ -75,7 +75,7 @@ export function ExportModal({
         )}
 
         {!exporting && result && (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
             <div
               style={{
                 display: 'flex',
@@ -87,30 +87,40 @@ export function ExportModal({
               }}
             >
               <CheckCircle2 size={16} />
-              已完成本地超分与 H.264 封装，全程零云端上传。
+              已完成本地超分与标准 MP4 封装，可直接预览或下载发送。
             </div>
 
             <video className="export-preview-video" src={result.url} controls playsInline loop />
 
-            <div className="prior-grid">
-              <span>文件名 <b>{result.fileName}</b></span>
-              <span>文件大小 <b>{formatSize(result.blob.size)}</b></span>
-              <span>输出分辨率 <b>{result.width}×{result.height}</b></span>
-              <span>导出范围 <b>{result.clippedToSec !== null ? `前 ${result.clippedToSec} 秒片段` : '完整视频'}</b></span>
-              <span>总帧数 <b>{result.frameCount} 帧</b></span>
-              <span>总耗时 <b>{result.elapsedSec.toFixed(2)} s</b></span>
-              <span>平均速度 <b>{result.avgFps.toFixed(1)} fps</b></span>
-              <span>音轨状态 <b>{result.hasAudio ? '已保留原 AAC 音轨' : '无音轨 / 仅视频'}</b></span>
-              <span>管线模式 <b>{result.pipelineUsed === 'webcodecs-mp4box' ? 'WebCodecs 硬解直通' : '兼容逐帧模式'}</b></span>
+            <div className="export-stats-grid">
+              <div className="stat-item">
+                <span>输出分辨率</span>
+                <b>{result.width}×{result.height}</b>
+              </div>
+              <div className="stat-item">
+                <span>文件大小</span>
+                <b>{formatSize(result.blob.size)}</b>
+              </div>
+              <div className="stat-item">
+                <span>总帧数 / 速度</span>
+                <b>{result.frameCount} 帧 · {result.avgFps.toFixed(0)} fps</b>
+              </div>
+              <div className="stat-item">
+                <span>音轨与范围</span>
+                <b>
+                  {result.hasAudio ? '保留原音轨' : '仅视频'} ·{' '}
+                  {result.clippedToSec !== null ? `前 ${result.clippedToSec}s` : '完整'}
+                </b>
+              </div>
             </div>
 
             <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 10 }}>
               <button className="btn" onClick={onClose}>
-                返回对比工作台
+                返回工作台
               </button>
               <button className="btn btn-primary" onClick={() => onDownload(result)}>
                 <Download size={15} />
-                下载超分 MP4
+                保存到本地 MP4
               </button>
             </div>
           </div>

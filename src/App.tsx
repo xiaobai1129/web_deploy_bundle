@@ -1,5 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent } from 'react';
-import { Cpu, Download, ShieldCheck, SlidersHorizontal, Sparkles, Upload } from 'lucide-react';
+import {
+  ChevronDown,
+  ChevronRight,
+  Cpu,
+  Download,
+  Film,
+  ShieldCheck,
+  SlidersHorizontal,
+  Sparkles,
+  Upload,
+} from 'lucide-react';
 import {
   encodeStreamPrior7d,
   type ModelScale,
@@ -26,12 +36,25 @@ import {
   type ExportProgress,
   type ExportResult,
 } from './video/mp4Exporter';
-import { ComparisonViewport } from './components/ComparisonViewport';
+import { ComparisonViewport, type StageDisplayMode } from './components/ComparisonViewport';
 import { GoldenVerifyModal } from './components/GoldenVerifyModal';
 import { ExportModal } from './components/ExportModal';
 
 const PRIOR_LABELS = ['QP 强度', 'HEVC 标志', '直播码控', '对数 BPP', 'RD 复杂度', '屏幕内容', '先验启用'];
 const CLIP_LIMIT_SEC = 10;
+
+const TIER_META: Record<ModelTier, { name: string; sub: string }> = {
+  L: { name: '极速', sub: '更快响应' },
+  S: { name: '均衡', sub: '日常推荐' },
+  P: { name: '精修', sub: '细节最佳' },
+};
+
+const DEMO_SHORT_TITLES: Record<string, string> = {
+  '01_ui_slide_editing_540p_x2.mp4': '文字与 PPT 录屏',
+  '02_cg_china_speed_540p_x2.mp4': 'CG 动画线条',
+  '03_detail_cactus_540p_x2.mp4': '低码率纹理去块',
+  '04_motion_jockey_720p_x1_5.mp4': '高速运动实拍',
+};
 
 export default function App() {
   // Core WebGPU engine state
@@ -59,7 +82,7 @@ export default function App() {
   const [qpMean, setQpMean] = useState(37.8);
   const [isScreenContent, setIsScreenContent] = useState(true);
   const [isLiveVbv, setIsLiveVbv] = useState(false);
-  const [showPriorDetail, setShowPriorDetail] = useState(false);
+  const [showAdvanced, setShowAdvanced] = useState(false);
 
   // Display & Playback state
   const [viewMode, setViewMode] = useState<CompareViewMode>(0);
@@ -67,6 +90,9 @@ export default function App() {
   const [zoom, setZoom] = useState(1);
   const [centerX, setCenterX] = useState(0.5);
   const [centerY, setCenterY] = useState(0.5);
+  const [stageDisplayMode, setStageDisplayMode] = useState<StageDisplayMode>('fit');
+  const [stageFillPct, setStageFillPct] = useState(100);
+  const displayBoxRef = useRef({ w: 0, h: 0 });
   const [isPlaying, setIsPlaying] = useState(false);
   const [isMuted, setIsMuted] = useState(true);
   const [isLoop, setIsLoop] = useState(true);
@@ -114,6 +140,8 @@ export default function App() {
   displayOptsRef.current = { splitX, viewMode, zoom, centerX, centerY };
   const workingResRef = useRef(workingRes);
   workingResRef.current = workingRes;
+  const outputSizeRef = useRef({ outputWidth, outputHeight });
+  outputSizeRef.current = { outputWidth, outputHeight };
   const inFlightGpuRef = useRef(0);
   const lastTelemetryAtRef = useRef(0);
   const exportingRef = useRef(false);
@@ -134,13 +162,42 @@ export default function App() {
     });
   }, [activeSource, workingRes.workW, workingRes.workH, qpMean, isLiveVbv, isScreenContent, usePrior, tier]);
 
+  // Size preview canvas backing buffer to stay razor-sharp even when small 144p outputs are scaled up to fill stage
+  const syncPreviewCanvasBackingSize = useCallback((targetOutW: number, targetOutH: number) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const dispW = displayBoxRef.current.w || canvas.clientWidth || targetOutW;
+    const dispH = displayBoxRef.current.h || canvas.clientHeight || targetOutH;
+    const scaleFactor = Math.min(
+      2560 / Math.max(1, targetOutW, targetOutH),
+      Math.max(1, (dispW * dpr) / Math.max(1, targetOutW), (dispH * dpr) / Math.max(1, targetOutH)),
+    );
+    const backingW = Math.max(2, Math.round(targetOutW * scaleFactor));
+    const backingH = Math.max(2, Math.round(targetOutH * scaleFactor));
+    if (canvas.width !== backingW || canvas.height !== backingH) {
+      canvas.width = backingW;
+      canvas.height = backingH;
+    }
+  }, []);
+
   // Render current GPU textures to display canvas without re-running inference
   const redrawCanvasOnly = useCallback(() => {
     const engine = engineRef.current;
     const ctx = canvasCtxRef.current;
     if (!engine || !ctx) return;
+    const { outputWidth: ow, outputHeight: oh } = outputSizeRef.current;
+    syncPreviewCanvasBackingSize(ow, oh);
     engine.renderToCanvas(ctx, displayOptsRef.current);
-  }, []);
+  }, [syncPreviewCanvasBackingSize]);
+
+  const handleDisplaySizeChange = useCallback(
+    (w: number, h: number) => {
+      displayBoxRef.current = { w, h };
+      redrawCanvasOnly();
+    },
+    [redrawCanvasOnly],
+  );
 
   // Process the current <video> frame through WebGPU SR and display it in a SINGLE non-blocking GPU submit
   const processAndDisplayCurrentFrame = useCallback(() => {
@@ -169,10 +226,7 @@ export default function App() {
       const { workW, workH } = workingResRef.current;
       const targetOutW = Math.round(workW * baked.scalars.scale);
       const targetOutH = Math.round(workH * baked.scalars.scale);
-      if (canvas.width !== targetOutW || canvas.height !== targetOutH) {
-        canvas.width = targetOutW;
-        canvas.height = targetOutH;
-      }
+      syncPreviewCanvasBackingSize(targetOutW, targetOutH);
 
       const t0 = performance.now();
       inFlightGpuRef.current++;
@@ -208,7 +262,7 @@ export default function App() {
       inFlightGpuRef.current = Math.max(0, inFlightGpuRef.current - 1);
       setRuntimeError(err instanceof Error ? err.message : String(err));
     }
-  }, []);
+  }, [syncPreviewCanvasBackingSize]);
 
   // Select a video source and configure smart working resolution, scale, clip mode & prior defaults
   const selectSource = useCallback((src: VideoSourceMeta) => {
@@ -226,6 +280,8 @@ export default function App() {
     setZoom(1);
     setCenterX(0.5);
     setCenterY(0.5);
+    setStageDisplayMode('fit');
+    setStageFillPct(100);
     setUploadError(null);
   }, []);
 
@@ -410,7 +466,7 @@ export default function App() {
       setUploadError(null);
       try {
         const meta = await probeLocalVideoFile(file);
-        setUploadedVideos((prev) => [meta, ...prev.slice(0, 5)]);
+        setUploadedVideos((prev) => [meta, ...prev.slice(0, 4)]);
         selectSource(meta);
       } catch (err) {
         setUploadError(err instanceof Error ? err.message : String(err));
@@ -503,7 +559,7 @@ export default function App() {
       totalFrames: estExportFrames,
       fps: 0,
       etaSec: 0,
-      message: '准备本地 WebGPU 超分导出...',
+      message: '准备本地超分导出...',
     });
 
     try {
@@ -544,9 +600,11 @@ export default function App() {
     a.remove();
   };
 
+  const strengthLabel = qpMean <= 26 ? '轻度' : qpMean <= 34 ? '适中' : '强力';
+
   return (
     <div className="app-shell">
-      {/* Visually-hidden hardware-decoded video feeder (avoid display:none so Chrome allocates GPU frame backing) */}
+      {/* Visually-hidden hardware-decoded video feeder */}
       <video
         ref={videoRef}
         playsInline
@@ -570,19 +628,18 @@ export default function App() {
         onChange={onFileInputChange}
       />
 
-      {/* Top Navigation Bar */}
+      {/* Minimalist Top Bar */}
       <header className="topbar">
         <div className="brand">
           <div className="brand-mark">
-            <Sparkles size={18} />
+            <Sparkles size={17} />
           </div>
-          <div>
+          <div className="brand-text">
             <div className="brand-title">
-              CodecSR V3.5
-              <span className="badge-pill">WebGPU 本地算力</span>
-              <span className="badge-pill ok">零云端上传</span>
+              CodecSR
+              <span className="badge-pill ok">本地 GPU 超分</span>
             </div>
-            <div className="brand-sub">纯前端实时视频超分对比与本地 MP4 导出工作台</div>
+            <div className="brand-sub">画质增强实时对比 · 全程本地处理不上传</div>
           </div>
         </div>
 
@@ -594,13 +651,13 @@ export default function App() {
               {initError
                 ? 'WebGPU 不可用'
                 : gpuInfo
-                  ? `${gpuInfo.vendor} · ${gpuInfo.description}`
+                  ? gpuInfo.description || gpuInfo.vendor
                   : '初始化 GPU...'}
             </span>
           </div>
 
           <button
-            className="btn"
+            className="btn btn-ghost"
             disabled={!engineReady || exporting}
             onClick={() => {
               setGoldenOpen(true);
@@ -608,10 +665,10 @@ export default function App() {
                 void handleRunGolden();
               }
             }}
-            title="使用 6 组官方标准向量验证本机 WebGPU 推理精度（PSNR ≥ 70 dB）"
+            title="运行 6 组标准向量验证当前 GPU 推理精度"
           >
-            <ShieldCheck size={15} />
-            精度对拍
+            <ShieldCheck size={14} />
+            精度校验
           </button>
 
           <button
@@ -619,15 +676,15 @@ export default function App() {
             disabled={!engineReady || !activeSource || exporting || modelLoading}
             onClick={() => void handleStartExport()}
           >
-            <Download size={15} />
-            导出超分 MP4
+            <Download size={14} />
+            导出 MP4
           </button>
         </div>
       </header>
 
       {/* Main Content */}
       {initError ? (
-        <div style={{ padding: 32, maxWidth: 680, margin: '40px auto' }}>
+        <div style={{ padding: 32, maxWidth: 620, margin: '48px auto' }}>
           <div className="error-box">
             <strong>WebGPU 初始化失败</strong>
             <div style={{ marginTop: 8 }}>{initError}</div>
@@ -641,15 +698,16 @@ export default function App() {
             canvasHeight={outputHeight}
             inputWidth={workingRes.workW}
             inputHeight={workingRes.workH}
-            tierLabel={`Client-${tier}`}
+            tierLabel={TIER_META[tier].name}
             scale={scale}
             viewMode={viewMode}
             splitX={splitX}
             zoom={zoom}
             centerX={centerX}
             centerY={centerY}
+            stageDisplayMode={stageDisplayMode}
+            stageFillPct={stageFillPct}
             inferenceMs={inferenceMs}
-            bakeMs={bakeMs}
             isPlaying={isPlaying}
             isMuted={isMuted}
             isLoop={isLoop}
@@ -662,6 +720,9 @@ export default function App() {
               setCenterX(cx);
               setCenterY(cy);
             }}
+            onStageDisplayModeChange={setStageDisplayMode}
+            onStageFillPctChange={setStageFillPct}
+            onDisplaySizeChange={handleDisplaySizeChange}
             onTogglePlay={togglePlay}
             onStepFrame={stepFrame}
             onSeek={seekTo}
@@ -671,37 +732,40 @@ export default function App() {
             onTriggerUpload={() => fileInputRef.current?.click()}
           />
 
-          {/* Right Control Panel */}
+          {/* Right Control Sidebar — Clean 3-Step Flow */}
           <aside className="sidebar">
             {runtimeError && <div className="error-box">{runtimeError}</div>}
 
-            {/* 1. Video Source Selection */}
+            {/* Step 1: Video Source */}
             <section className="panel-card">
               <div className="panel-title">
-                <span>1. 视频源（本地上传 / 演示样片）</span>
-                {activeSource && !activeSource.isDemo && <span className="badge-pill ok">本地视频</span>}
+                <span className="panel-title-left">
+                  <Film size={13} /> 选择视频
+                </span>
+                {activeSource && (
+                  <span className={`badge-pill ${activeSource.isDemo ? '' : 'ok'}`}>
+                    {activeSource.isDemo ? '演示样片' : '本地视频'}
+                  </span>
+                )}
               </div>
 
               <div className="upload-zone" onClick={() => fileInputRef.current?.click()}>
-                <Upload size={20} color="#38bdf8" />
-                <div className="upload-zone-title">点击选择或拖拽本地视频到画面</div>
-                <div className="upload-zone-sub">
-                  支持 MP4 / HEVC / WebM / MOV（横竖屏均可）· 建议 10 秒以内视频，超过 10 秒可选择仅导出前 10 秒
+                <div className="upload-icon-wrap">
+                  <Upload size={16} />
+                </div>
+                <div className="upload-zone-body">
+                  <div className="upload-zone-title">上传本地视频</div>
+                  <div className="upload-zone-sub">点击选择或拖拽到左侧画面 · MP4 / MOV / WebM</div>
                 </div>
               </div>
 
               {uploadError && <div className="error-box">{uploadError}</div>}
 
-              {/* Smart High-Res / Phone Recording Protection Banner */}
               {activeSource && !activeSource.isDemo && activeSource.isHighRes && (
                 <div className="info-box">
-                  <div>
-                    <strong>检测到超清原片</strong>（{activeSource.width}×{activeSource.height} ·{' '}
-                    {(activeSource.bitrateKbps / 1000).toFixed(1)} Mbps ·{' '}
-                    {formatCodecDisplayName(activeSource.codec)}）
-                  </div>
-                  <div style={{ marginTop: 4, fontSize: 11, opacity: 0.92 }}>
-                    原片分辨率已高于 720p，直接原分辨率超分计算量极大且网页缩略图难以看出差异。建议先用「流畅档」体验实时对比，也可按需切换原分辨率：
+                  <div className="info-box-head">
+                    <strong>超清原片 ({activeSource.width}×{activeSource.height})</strong>
+                    <span>{formatCodecDisplayName(activeSource.codec)}</span>
                   </div>
                   <div className="segmented" style={{ marginTop: 8, width: '100%' }}>
                     <button
@@ -709,7 +773,7 @@ export default function App() {
                       className={inputResMode === 'auto_720p' ? 'active' : ''}
                       onClick={() => handleInputModeChange('auto_720p')}
                     >
-                      720p 流畅 (推荐)
+                      720p 流畅
                     </button>
                     <button
                       style={{ flex: 1, justifyContent: 'center' }}
@@ -723,56 +787,66 @@ export default function App() {
                       className={inputResMode === 'original' ? 'active' : ''}
                       onClick={() => handleInputModeChange('original')}
                     >
-                      原分辨率
+                      原画尺寸
                     </button>
                   </div>
                 </div>
               )}
 
               {uploadedVideos.length > 0 && (
-                <div className="demo-list">
-                  {uploadedVideos.map((u) => (
-                    <button
-                      key={u.id}
-                      className={`demo-item ${activeSource?.id === u.id ? 'active' : ''}`}
-                      onClick={() => selectSource(u)}
-                    >
-                      <div className="demo-item-top">
-                        <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                          {u.name}
-                        </span>
-                        <span className="badge-pill ok">{u.durationSec.toFixed(1)}s</span>
-                      </div>
-                      <div className="demo-item-desc">{u.description}</div>
-                    </button>
-                  ))}
+                <div className="source-group">
+                  <div className="source-group-label">已导入</div>
+                  <div className="demo-list">
+                    {uploadedVideos.map((u) => (
+                      <button
+                        key={u.id}
+                        className={`demo-item ${activeSource?.id === u.id ? 'active' : ''}`}
+                        onClick={() => selectSource(u)}
+                      >
+                        <div className="demo-item-top">
+                          <span className="demo-name">{u.name}</span>
+                          <span className="demo-meta">
+                            {u.width}×{u.height} · {u.durationSec.toFixed(0)}s
+                          </span>
+                        </div>
+                      </button>
+                    ))}
+                  </div>
                 </div>
               )}
 
-              <div className="demo-list">
-                {demoVideos.map((d) => (
-                  <button
-                    key={d.id}
-                    className={`demo-item ${activeSource?.id === d.id ? 'active' : ''}`}
-                    onClick={() => selectSource(d)}
-                  >
-                    <div className="demo-item-top">
-                      <span>{d.name.replace(/\.mp4$/, '')}</span>
-                      <span className="badge-pill">
-                        {d.width}×{d.height} · ×{d.recommendedScale}
-                      </span>
-                    </div>
-                    <div className="demo-item-desc">{d.description}</div>
-                  </button>
-                ))}
+              <div className="source-group">
+                <div className="source-group-label">内置样片</div>
+                <div className="demo-list">
+                  {demoVideos.map((d) => (
+                    <button
+                      key={d.id}
+                      className={`demo-item ${activeSource?.id === d.id ? 'active' : ''}`}
+                      onClick={() => selectSource(d)}
+                    >
+                      <div className="demo-item-top">
+                        <span className="demo-name">
+                          {DEMO_SHORT_TITLES[d.name] ?? d.name.replace(/\.mp4$/, '')}
+                        </span>
+                        <span className="demo-meta">
+                          {d.height}p · ×{d.recommendedScale}
+                        </span>
+                      </div>
+                    </button>
+                  ))}
+                </div>
               </div>
             </section>
 
-            {/* 2. Model Tier & Scale (Shared by Live Preview + Export) */}
+            {/* Step 2: Enhancement Settings */}
             <section className="panel-card">
               <div className="panel-title">
-                <span>2. 模型档位与倍率</span>
-                <span className="badge-pill">实时预览 &amp; 导出共用</span>
+                <span className="panel-title-left">
+                  <SlidersHorizontal size={13} /> 画质增强
+                </span>
+                <span className="res-preview-pill">
+                  {workingRes.workW}×{workingRes.workH} → {outputWidth}×{outputHeight}
+                </span>
               </div>
 
               <div className="tier-grid">
@@ -782,8 +856,8 @@ export default function App() {
                     className={`tier-btn ${tier === t ? 'active' : ''}`}
                     onClick={() => setTier(t)}
                   >
-                    <strong>Client-{t}</strong>
-                    <span>{t === 'L' ? '极速低延迟' : t === 'S' ? '标准推荐' : '旗舰沙漏'}</span>
+                    <strong>{TIER_META[t].name}</strong>
+                    <span>{TIER_META[t].sub}</span>
                   </button>
                 ))}
               </div>
@@ -792,43 +866,21 @@ export default function App() {
                 <span>放大倍率</span>
                 <div className="segmented">
                   <button className={scale === 2.0 ? 'active' : ''} onClick={() => setScale(2.0)}>
-                    ×2.0 (低清推荐)
+                    ×2.0
                   </button>
                   <button className={scale === 1.5 ? 'active' : ''} onClick={() => setScale(1.5)}>
-                    ×1.5 (720p 推荐)
+                    ×1.5
                   </button>
                 </div>
               </div>
 
-              {tier !== 'P' && (
-                <label className="toggle-row" title="将视频压缩特征输入模型，动态适配不同模糊程度">
-                  <span>启用 7D 码流动态先验（自适应去压缩模糊）</span>
-                  <input
-                    type="checkbox"
-                    checked={usePrior}
-                    onChange={(e) => setUsePrior(e.target.checked)}
-                  />
-                </label>
-              )}
-
-              <div className="hint-text">
-                {activeModel.tagline}（权重 {activeModel.sizeKb} KB）
-              </div>
-            </section>
-
-            {/* 3. 7D Stream Prior Live Baking (Shared by Live Preview + Export) */}
-            <section className="panel-card">
-              <div className="panel-title">
-                <span style={{ display: 'inline-flex', alignItems: 'center', gap: 5 }}>
-                  <SlidersHorizontal size={13} /> 3. 修复强度微调
-                </span>
-                <span className="badge-pill ok">实时生效 · {bakeMs.toFixed(1)} ms</span>
-              </div>
-
-              <div>
-                <div className="field-row" style={{ marginBottom: 4 }}>
-                  <span>压缩模糊修复强度（虚拟 QP）</span>
-                  <strong>QP {qpMean.toFixed(1)}</strong>
+              <div className="slider-block">
+                <div className="field-row">
+                  <span>去模糊强度</span>
+                  <span className="strength-readout">
+                    <strong>{strengthLabel}</strong>
+                    <small>QP {qpMean.toFixed(0)}</small>
+                  </span>
                 </div>
                 <input
                   type="range"
@@ -840,107 +892,119 @@ export default function App() {
                   disabled={!activeModel.usePrior}
                   onChange={(e) => setQpMean(Number(e.target.value))}
                 />
-                <div className="field-row" style={{ fontSize: 10, color: '#64748b' }}>
-                  <span>20 · 原片清晰/轻度增强</span>
-                  <span>30 · 标准平衡</span>
-                  <span>42 · 原片很糊/强力去块</span>
+                <div className="slider-ticks">
+                  <span>柔和</span>
+                  <span>均衡</span>
+                  <span>强力去块</span>
                 </div>
               </div>
 
-              <label
-                className="toggle-row"
-                title="针对录屏、PPT、字幕、软件界面压制文字边缘白边重影（振铃效应）"
-              >
-                <span>文字 / UI / 录屏抗白边优化</span>
-                <input
-                  type="checkbox"
-                  checked={isScreenContent}
+              <div className="scene-chip-row">
+                <button
+                  type="button"
+                  className={`scene-chip ${isScreenContent ? 'active' : ''}`}
                   disabled={!activeModel.usePrior}
-                  onChange={(e) => setIsScreenContent(e.target.checked)}
-                />
-              </label>
-
-              <label
-                className="toggle-row"
-                title="针对低码率直播画面剧烈压缩和块效应开启"
-              >
-                <span>低码率直播画质波动优化（VBV）</span>
-                <input
-                  type="checkbox"
-                  checked={isLiveVbv}
+                  onClick={() => setIsScreenContent((v) => !v)}
+                  title="针对文字、字幕、PPT、录屏减少边缘白边重影"
+                >
+                  <span className="chip-dot" />
+                  文字 / 字幕锐化
+                </button>
+                <button
+                  type="button"
+                  className={`scene-chip ${isLiveVbv ? 'active' : ''}`}
                   disabled={!activeModel.usePrior}
-                  onChange={(e) => setIsLiveVbv(e.target.checked)}
-                />
-              </label>
+                  onClick={() => setIsLiveVbv((v) => !v)}
+                  title="针对低码率直播或严重压缩画面增强去块效果"
+                >
+                  <span className="chip-dot" />
+                  低码率去块
+                </button>
+              </div>
 
+              {/* Collapsible Advanced / Engineering Details */}
               <button
-                className="btn"
-                style={{ padding: '5px 10px', fontSize: 11 }}
-                onClick={() => setShowPriorDetail((s) => !s)}
+                type="button"
+                className="accordion-trigger"
+                onClick={() => setShowAdvanced((s) => !s)}
               >
-                {showPriorDetail ? '收起 7D 先验参数明细' : '查看 7D 先验参数明细'}
+                <span>高级参数（Client-{tier} · {activeModel.sizeKb} KB）</span>
+                {showAdvanced ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
               </button>
 
-              {showPriorDetail && (
-                <div className="prior-grid">
-                  {PRIOR_LABELS.map((lbl, idx) => (
-                    <span key={lbl}>
-                      {lbl} <b>{prior7d[idx].toFixed(3)}</b>
-                    </span>
-                  ))}
+              {showAdvanced && (
+                <div className="advanced-drawer">
+                  {tier !== 'P' && (
+                    <label className="toggle-row">
+                      <span>启用 7D 动态先验</span>
+                      <input
+                        type="checkbox"
+                        checked={usePrior}
+                        onChange={(e) => setUsePrior(e.target.checked)}
+                      />
+                    </label>
+                  )}
+                  <div className="field-row" style={{ fontSize: 11 }}>
+                    <span>核烘焙耗时</span>
+                    <strong>{bakeMs.toFixed(2)} ms</strong>
+                  </div>
+                  <div className="prior-grid">
+                    {PRIOR_LABELS.map((lbl, idx) => (
+                      <span key={lbl}>
+                        {lbl} <b>{prior7d[idx].toFixed(2)}</b>
+                      </span>
+                    ))}
+                  </div>
                 </div>
               )}
             </section>
 
-            {/* 4. Local MP4 Export Card (Export-Only Settings) */}
+            {/* Step 3: Export */}
             <section className="panel-card">
               <div className="panel-title">
-                <span>4. 本地导出超分 MP4</span>
-                <span className="badge-pill warn">仅导出编码设置</span>
-              </div>
-
-              <div className="field-row">
-                <span>导出分辨率</span>
-                <strong>
-                  {Math.max(16, outputWidth & ~1)}×{Math.max(16, outputHeight & ~1)}
-                  {workingRes.wasDownscaled ? '（流畅档）' : ''}
-                </strong>
+                <span className="panel-title-left">
+                  <Download size={13} /> 导出视频
+                </span>
+                <span className="hint-inline">
+                  {Math.max(16, outputWidth & ~1)}×{Math.max(16, outputHeight & ~1)} MP4
+                </span>
               </div>
 
               {isLongVideo && activeSource && (
-                <div className="notice-box">
-                  <div>
-                    当前视频时长 <strong>{activeSource.durationSec.toFixed(1)} 秒</strong>（建议 ≤10 秒以快速完成）。请选择导出范围：
-                  </div>
-                  <div className="segmented" style={{ marginTop: 8, width: '100%' }}>
+                <div className="field-row">
+                  <span>导出范围</span>
+                  <div className="segmented">
                     <button
-                      style={{ flex: 1, justifyContent: 'center' }}
                       className={exportClipMode === 'first10s' ? 'active' : ''}
                       onClick={() => setExportClipMode('first10s')}
                     >
-                      仅导出前 10 秒 (推荐)
+                      前 10 秒
                     </button>
                     <button
-                      style={{ flex: 1, justifyContent: 'center' }}
                       className={exportClipMode === 'full' ? 'active' : ''}
                       onClick={() => setExportClipMode('full')}
                     >
-                      导出全部 ({Math.round(activeSource.durationSec)}s)
+                      全部 ({Math.round(activeSource.durationSec)}s)
                     </button>
                   </div>
                 </div>
               )}
 
               <div className="field-row">
-                <span>导出画质码率</span>
+                <span>画质码率</span>
                 <div className="segmented">
-                  {[8, 15, 25].map((mbps) => (
+                  {[
+                    { v: 8, label: '标准' },
+                    { v: 15, label: '高清' },
+                    { v: 25, label: '极清' },
+                  ].map((item) => (
                     <button
-                      key={mbps}
-                      className={exportBitrateMbps === mbps ? 'active' : ''}
-                      onClick={() => setExportBitrateMbps(mbps)}
+                      key={item.v}
+                      className={exportBitrateMbps === item.v ? 'active' : ''}
+                      onClick={() => setExportBitrateMbps(item.v)}
+                      title={`${item.v} Mbps`}
                     >
-                      {mbps} Mbps
+                      {item.label}
                     </button>
                   ))}
                 </div>
@@ -954,19 +1018,19 @@ export default function App() {
               >
                 <Download size={15} />
                 {exporting
-                  ? '正在导出中...'
+                  ? '正在导出...'
                   : isLongVideo && exportClipMode === 'first10s'
-                    ? `导出前 10 秒超分 MP4（约 ${estExportFrames} 帧）`
-                    : `开始本地超分并导出 MP4（约 ${estExportFrames} 帧）`}
+                    ? '导出前 10 秒超分 MP4'
+                    : '导出超分 MP4'}
               </button>
 
               {exportResult && !exporting && (
                 <button
-                  className="btn"
+                  className="btn btn-subtle"
                   style={{ width: '100%' }}
                   onClick={() => setExportModalOpen(true)}
                 >
-                  查看上次导出预览 &amp; 再次下载
+                  查看上次导出预览 &amp; 下载
                 </button>
               )}
             </section>
