@@ -482,8 +482,22 @@ export default function App() {
 
   return (
     <div className="app-shell">
-      {/* Hidden hardware-decoded video feeder */}
-      <video ref={videoRef} playsInline style={{ display: 'none' }} />
+      {/* Visually-hidden hardware-decoded video feeder (avoid display:none so Chrome allocates GPU frame backing) */}
+      <video
+        ref={videoRef}
+        playsInline
+        preload="auto"
+        style={{
+          position: 'fixed',
+          left: 0,
+          top: 0,
+          width: 2,
+          height: 2,
+          opacity: 0.001,
+          pointerEvents: 'none',
+          zIndex: -1,
+        }}
+      />
       <input
         ref={fileInputRef}
         type="file"

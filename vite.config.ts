@@ -41,5 +41,15 @@ export default defineConfig({
     host: '127.0.0.1',
     port: 4173,
   },
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          media: ['mp4box', 'mp4-muxer'],
+          react: ['react', 'react-dom'],
+        },
+      },
+    },
+  },
   assetsInclude: ['**/*.wgsl'],
 });

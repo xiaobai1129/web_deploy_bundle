@@ -122,6 +122,8 @@ export class CodecSREngine {
   private activeBaked: BakedSsboResult | null = null;
   private activeBlob: ParsedBlob | null = null;
   private workspace: FrameWorkspace | null = null;
+  private fallback2dCanvas: HTMLCanvasElement | null = null;
+  private fallback2dCtx: CanvasRenderingContext2D | null = null;
 
   private constructor(
     device: GPUDevice,
@@ -877,6 +879,44 @@ export class CodecSREngine {
     return this.workspace;
   }
 
+  private uploadExternalSource(
+    source: GPUCopyExternalImageSource,
+    dstTex: GPUTexture,
+    srcW: number,
+    srcH: number,
+  ): void {
+    try {
+      this.device.queue.copyExternalImageToTexture(
+        { source },
+        { texture: dstTex },
+        [srcW, srcH, 1],
+      );
+    } catch (err) {
+      // Chromium can transiently reject paused/offscreen HTMLVideoElement before compositor backing exists.
+      // Fall back transparently via a reusable 2D staging canvas so frame 0 / seeked frames always render.
+      if (typeof HTMLVideoElement !== 'undefined' && source instanceof HTMLVideoElement) {
+        if (!this.fallback2dCanvas) {
+          this.fallback2dCanvas = document.createElement('canvas');
+          this.fallback2dCtx = this.fallback2dCanvas.getContext('2d', { willReadFrequently: false });
+        }
+        if (this.fallback2dCanvas && this.fallback2dCtx) {
+          if (this.fallback2dCanvas.width !== srcW || this.fallback2dCanvas.height !== srcH) {
+            this.fallback2dCanvas.width = srcW;
+            this.fallback2dCanvas.height = srcH;
+          }
+          this.fallback2dCtx.drawImage(source, 0, 0, srcW, srcH);
+          this.device.queue.copyExternalImageToTexture(
+            { source: this.fallback2dCanvas },
+            { texture: dstTex },
+            [srcW, srcH, 1],
+          );
+          return;
+        }
+      }
+      throw err;
+    }
+  }
+
   /**
    * Uploads one video frame, runs full CodecSR V3.5 WebGPU inference, and writes SR (+ optional Bicubic) RGBA textures.
    */
@@ -891,11 +931,7 @@ export class CodecSREngine {
     }
     const ws = this.ensureWorkspace(srcW, srcH, this.activeBaked);
 
-    this.device.queue.copyExternalImageToTexture(
-      { source },
-      { texture: ws.srcTex },
-      [srcW, srcH, 1],
-    );
+    this.uploadExternalSource(source, ws.srcTex, srcW, srcH);
 
     const encoder = this.device.createCommandEncoder();
 

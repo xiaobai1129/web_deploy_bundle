@@ -246,6 +246,7 @@ async function exportViaMp4BoxWebCodecs(
           }
         : undefined,
     fastStart: 'in-memory',
+    firstTimestampBehavior: 'offset',
   });
 
   const { canvas: exportCanvas, ctx: exportCtx } = createExportCanvas(
@@ -467,6 +468,7 @@ async function exportViaVideoElementFallback(
     target,
     video: { codec: 'avc', width: encW, height: encH },
     fastStart: 'in-memory',
+    firstTimestampBehavior: 'offset',
   });
 
   const { canvas: exportCanvas, ctx: exportCtx } = createExportCanvas(
