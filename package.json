@@ -1,0 +1,31 @@
+{
+  "name": "codecsr-web-studio",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "CodecSR V3.5 pure-frontend WebGPU video super-resolution workbench",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "lucide-react": "^0.469.0",
+    "mp4-muxer": "^5.1.4",
+    "mp4box": "^0.5.3",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.11",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^4.3.4",
+    "@webgpu/types": "^0.1.50",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.7",
+    "vitest": "^3.0.5"
+  }
+}
