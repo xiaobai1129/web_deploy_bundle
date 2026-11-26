@@ -249,12 +249,19 @@ async function tryProbeMp4Track(file: File): Promise<Mp4ProbeInfo | null> {
 
       (async () => {
         try {
+          // Concatenate ftyp + moov contiguously at fileStart=0 so mp4box parses headers in <5ms
+          // without waiting for skipped mdat bytes on huge tail-moov phone recordings.
+          const totalBytes = slicesToFeed.reduce((sum, b) => sum + b.size, 0);
+          const merged = new Uint8Array(totalBytes);
+          let pos = 0;
           for (const box of slicesToFeed) {
             const ab = await file.slice(box.offset, box.offset + box.size).arrayBuffer();
-            const mp4Buf = ab as MP4Box.MP4ArrayBuffer;
-            mp4Buf.fileStart = box.offset;
-            mp4.appendBuffer(mp4Buf);
+            merged.set(new Uint8Array(ab), pos);
+            pos += ab.byteLength;
           }
+          const mp4Buf = merged.buffer as MP4Box.MP4ArrayBuffer;
+          mp4Buf.fileStart = 0;
+          mp4.appendBuffer(mp4Buf);
           mp4.flush();
         } catch {
           clearTimeout(timer);
