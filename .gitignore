@@ -1,0 +1,67 @@
+# OS / macOS / Windows
+.DS_Store
+._*
+Thumbs.db
+Desktop.ini
+
+# Editors / IDEs
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+*~
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+
+# Node / Web Frontend (Vite, TypeScript, React)
+node_modules/
+dist/
+dist-ssr/
+build/
+out/
+.vite/
+.cache/
+.parcel-cache/
+.turbo/
+*.tsbuildinfo
+*.local
+.env
+.env.local
+.env.*.local
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Web Testing & Coverage
+coverage/
+.nyc_output/
+playwright-report/
+test-results/
+
+# Static Deployment Tooling
+.vercel/
+.wrangler/
+.netlify/
+.cloudflare/
+
+# Local / Temporary Video & Media Files (keep bundled demo clips)
+*.mp4
+*.mov
+*.mkv
+*.webm
+*.avi
+*.m4v
+*.flv
+*.yuv
+*.y4m
+!demo_videos/*.mp4
