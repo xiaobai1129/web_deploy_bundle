@@ -146,6 +146,11 @@ export class CodecSREngine {
   private activeFastWeights: PackedFastWeights | null = null;
   private activeBlob: ParsedBlob | null = null;
   private workspace: FrameWorkspace | null = null;
+  private exportReadbackBuf: GPUBuffer | null = null;
+  private exportReadbackSize = 0;
+  private export2dCanvas: HTMLCanvasElement | null = null;
+  private export2dCtx: CanvasRenderingContext2D | null = null;
+  private exportImageData: ImageData | null = null;
   private fallback2dCanvas: HTMLCanvasElement | null = null;
   private fallback2dCtx: CanvasRenderingContext2D | null = null;
 
@@ -1323,6 +1328,122 @@ export class CodecSREngine {
     this.device.queue.submit([encoder.finish()]);
   }
 
+  /**
+   * Runs the SR compute pipeline and reads back the exact RGBA output directly from `ws.srTex`
+   * via `copyTextureToBuffer` + `mapAsync`, constructing a WebCodecs `VideoFrame` with ZERO
+   * off-DOM WebGPU canvas swapchain involvement (prevents double-buffer stale-frame ping-pong
+   * during fast offline MP4 export).
+   */
+  async processFrameToVideoFrame(
+    source: GPUCopyExternalImageSource,
+    srcW: number,
+    srcH: number,
+    frameInit: { timestamp: number; duration: number; width: number; height: number },
+    targetWorkSize?: { workW: number; workH: number },
+  ): Promise<VideoFrame> {
+    if (!this.activeBaked || !this.activeFastWeights || !this.weightBuf) {
+      throw new Error('模型尚未初始化');
+    }
+    const workW = targetWorkSize?.workW ?? srcW;
+    const workH = targetWorkSize?.workH ?? srcH;
+    const ws = this.ensureWorkspace(srcW, srcH, workW, workH, this.activeBaked, this.activeFastWeights);
+
+    const copyW = Math.min(frameInit.width, ws.outW);
+    const copyH = Math.min(frameInit.height, ws.outH);
+    const rowBytes = copyW * 4;
+    // WebGPU copyTextureToBuffer requires bytesPerRow to be a multiple of 256
+    const bytesPerRow = Math.ceil(rowBytes / 256) * 256;
+    const neededBytes = bytesPerRow * copyH;
+
+    if (!this.exportReadbackBuf || this.exportReadbackSize < neededBytes) {
+      this.exportReadbackBuf?.destroy();
+      this.exportReadbackBuf = this.device.createBuffer({
+        label: 'sr_export_rgba_readback',
+        size: neededBytes,
+        usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+      });
+      this.exportReadbackSize = neededBytes;
+    }
+
+    this.uploadExternalSource(source, ws.srcTex, srcW, srcH);
+
+    const encoder = this.device.createCommandEncoder();
+
+    // 1. RGB -> Full-Range BT.601 Luma Y
+    {
+      const pass = encoder.beginComputePass();
+      pass.setPipeline(this.rgb2yPipeline);
+      pass.setBindGroup(0, ws.rgb2yBindGroup);
+      pass.dispatchWorkgroups(Math.ceil(ws.padW / 16), Math.ceil(ws.padH / 16), 1);
+      pass.end();
+    }
+
+    // 2. Cached CodecSR V3.5 compute plan
+    this.encodePlanSteps(encoder, ws.planSteps);
+
+    // 3. Y_sr + upsampled CbCr -> RGBA (ws.srTex)
+    {
+      const pass = encoder.beginComputePass();
+      pass.setPipeline(this.y2rgbPipeline);
+      pass.setBindGroup(0, ws.y2rgbSrBindGroup);
+      pass.dispatchWorkgroups(Math.ceil(ws.outW / 16), Math.ceil(ws.outH / 16), 1);
+      pass.end();
+    }
+
+    // 4. Deterministic GPU texture -> staging buffer copy in the SAME command buffer
+    encoder.copyTextureToBuffer(
+      { texture: ws.srTex, origin: { x: 0, y: 0, z: 0 } },
+      { buffer: this.exportReadbackBuf, bytesPerRow, rowsPerImage: copyH },
+      { width: copyW, height: copyH, depthOrArrayLayers: 1 },
+    );
+
+    this.device.queue.submit([encoder.finish()]);
+    await this.exportReadbackBuf.mapAsync(GPUMapMode.READ, 0, neededBytes);
+
+    // Prepare a synchronous 2D canvas + ImageData backing store so:
+    // 1. We unmap the GPU staging buffer immediately after copying bytes into ImageData.
+    // 2. We construct `new VideoFrame(export2dCanvas, ...)` which is 100% synchronous (no WebGPU
+    //    swapchain double-buffering) and universally accepted by all hardware VideoEncoders.
+    if (!this.export2dCanvas) {
+      this.export2dCanvas = document.createElement('canvas');
+      this.export2dCtx = this.export2dCanvas.getContext('2d', { willReadFrequently: false });
+    }
+    if (!this.export2dCtx) {
+      this.exportReadbackBuf.unmap();
+      throw new Error('无法创建导出用 2D 位图画布上下文');
+    }
+    if (this.export2dCanvas.width !== copyW || this.export2dCanvas.height !== copyH) {
+      this.export2dCanvas.width = copyW;
+      this.export2dCanvas.height = copyH;
+      this.exportImageData = this.export2dCtx.createImageData(copyW, copyH);
+    } else if (!this.exportImageData || this.exportImageData.width !== copyW || this.exportImageData.height !== copyH) {
+      this.exportImageData = this.export2dCtx.createImageData(copyW, copyH);
+    }
+
+    try {
+      const mapped = new Uint8Array(this.exportReadbackBuf.getMappedRange(0, neededBytes));
+      const dst = this.exportImageData.data;
+      if (bytesPerRow === rowBytes) {
+        dst.set(mapped);
+      } else {
+        for (let y = 0; y < copyH; y++) {
+          dst.set(
+            mapped.subarray(y * bytesPerRow, y * bytesPerRow + rowBytes),
+            y * rowBytes,
+          );
+        }
+      }
+    } finally {
+      this.exportReadbackBuf.unmap();
+    }
+
+    this.export2dCtx.putImageData(this.exportImageData, 0, 0);
+    return new VideoFrame(this.export2dCanvas, {
+      timestamp: frameInit.timestamp,
+      duration: frameInit.duration,
+    });
+  }
+
   async waitGpuIdle(): Promise<void> {
     await this.device.queue.onSubmittedWorkDone();
   }
@@ -1349,6 +1470,12 @@ export class CodecSREngine {
 
   destroy(): void {
     this.destroyWorkspace();
+    this.exportReadbackBuf?.destroy();
+    this.exportReadbackBuf = null;
+    this.exportReadbackSize = 0;
+    this.export2dCanvas = null;
+    this.export2dCtx = null;
+    this.exportImageData = null;
     this.weightBuf?.destroy();
     this.paramsBuf.destroy();
     this.displayUniformBuf.destroy();
