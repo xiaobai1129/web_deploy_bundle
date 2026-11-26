@@ -366,10 +366,12 @@ export function ComparisonViewport({
                   width: `${computedFrameSize.w}px`,
                   height: `${computedFrameSize.h}px`,
                   cursor: zoom > 1 ? 'grab' : viewMode === 0 ? 'ew-resize' : 'default',
+                  touchAction: viewMode === 0 || zoom > 1 ? 'none' : 'auto',
                 }
               : {
                   aspectRatio: `${Math.max(1, canvasWidth)} / ${Math.max(1, canvasHeight)}`,
                   cursor: zoom > 1 ? 'grab' : viewMode === 0 ? 'ew-resize' : 'default',
+                  touchAction: viewMode === 0 || zoom > 1 ? 'none' : 'auto',
                 }
           }
           onPointerDown={onPointerDown}
@@ -449,48 +451,54 @@ export function ComparisonViewport({
 
       {/* Bottom Playback Bar */}
       <div className="transport-bar">
-        <button className="btn btn-primary btn-icon" onClick={onTogglePlay} title={isPlaying ? '暂停' : '播放'}>
-          {isPlaying ? <Pause size={15} /> : <Play size={15} />}
-        </button>
-        <button className="btn btn-icon" onClick={() => onStepFrame(-1)} title="上一帧">
-          <ChevronLeft size={15} />
-        </button>
-        <button className="btn btn-icon" onClick={() => onStepFrame(1)} title="下一帧">
-          <ChevronRight size={15} />
-        </button>
+        <div className="transport-controls-group">
+          <button className="btn btn-primary btn-icon" onClick={onTogglePlay} title={isPlaying ? '暂停' : '播放'}>
+            {isPlaying ? <Pause size={15} /> : <Play size={15} />}
+          </button>
+          <button className="btn btn-icon" onClick={() => onStepFrame(-1)} title="上一帧">
+            <ChevronLeft size={15} />
+          </button>
+          <button className="btn btn-icon" onClick={() => onStepFrame(1)} title="下一帧">
+            <ChevronRight size={15} />
+          </button>
+        </div>
 
-        <span className="time-readout">
-          {formatTime(currentTime)} / {formatTime(duration)}
-        </span>
+        <div className="transport-timeline-group">
+          <span className="time-readout">
+            {formatTime(currentTime)} / {formatTime(duration)}
+          </span>
 
-        <input
-          type="range"
-          className="timeline-range"
-          min={0}
-          max={Math.max(0.01, duration)}
-          step={0.01}
-          value={Math.min(currentTime, duration)}
-          onChange={(e) => onSeek(Number(e.target.value))}
-          aria-label="播放进度"
-        />
+          <input
+            type="range"
+            className="timeline-range"
+            min={0}
+            max={Math.max(0.01, duration)}
+            step={0.01}
+            value={Math.min(currentTime, duration)}
+            onChange={(e) => onSeek(Number(e.target.value))}
+            aria-label="播放进度"
+          />
+        </div>
 
-        <button
-          className={`btn btn-icon ${isLoop ? 'btn-active-icon' : ''}`}
-          onClick={onToggleLoop}
-          title={isLoop ? '循环播放：开' : '循环播放：关'}
-        >
-          <Repeat size={14} />
-        </button>
-        <button
-          className="btn btn-icon"
-          onClick={onToggleMute}
-          title={isMuted ? '取消静音' : '静音'}
-        >
-          {isMuted ? <VolumeX size={14} /> : <Volume2 size={14} />}
-        </button>
-        <button className="btn" onClick={onTriggerUpload}>
-          <Upload size={14} /> 换个视频
-        </button>
+        <div className="transport-actions-group">
+          <button
+            className={`btn btn-icon ${isLoop ? 'btn-active-icon' : ''}`}
+            onClick={onToggleLoop}
+            title={isLoop ? '循环播放：开' : '循环播放：关'}
+          >
+            <Repeat size={14} />
+          </button>
+          <button
+            className="btn btn-icon"
+            onClick={onToggleMute}
+            title={isMuted ? '取消静音' : '静音'}
+          >
+            {isMuted ? <VolumeX size={14} /> : <Volume2 size={14} />}
+          </button>
+          <button className="btn" onClick={onTriggerUpload}>
+            <Upload size={14} /> 换个视频
+          </button>
+        </div>
       </div>
     </div>
   );

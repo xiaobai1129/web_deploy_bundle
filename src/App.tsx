@@ -666,9 +666,10 @@ export default function App() {
               }
             }}
             title="运行 6 组标准向量验证当前 GPU 推理精度"
+            aria-label="精度校验"
           >
             <ShieldCheck size={14} />
-            精度校验
+            <span className="hide-mobile">精度校验</span>
           </button>
 
           <button
