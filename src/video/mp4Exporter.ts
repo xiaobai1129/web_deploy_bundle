@@ -22,15 +22,19 @@ export interface ExportResult {
   elapsedSec: number;
   avgFps: number;
   hasAudio: boolean;
+  clippedToSec: number | null;
   pipelineUsed: 'webcodecs-mp4box' | 'video-element-fallback';
 }
 
 export interface ExportOptions {
   engine: CodecSREngine;
   source: VideoSourceMeta;
+  workW: number;
+  workH: number;
   bitrateMbps: number;
   tierLabel: string;
   scale: number;
+  maxDurationSec?: number; // e.g. 10 for "first 10 seconds" clip mode
   signal: AbortSignal;
   onProgress: (p: ExportProgress) => void;
 }
@@ -41,6 +45,7 @@ const AVC_CANDIDATE_CODECS = [
   'avc1.640032', // High 5.0
   'avc1.64002a', // High 4.2 (1080p@60fps)
   'avc1.640028', // High 4.0 (1080p@30fps)
+  'avc1.4d0034', // Main 5.2
   'avc1.4d0033', // Main 5.1
   'avc1.4d002a', // Main 4.2
   'avc1.420028', // Baseline 4.0
@@ -78,7 +83,9 @@ async function pickH264EncoderConfig(
       }
     }
   }
-  throw new Error(`浏览器硬件/软件 H.264 编码器不支持当前输出规格 (${width}×${height} @ ${safeFps}fps)。`);
+  throw new Error(
+    `浏览器 H.264 编码器不支持当前输出分辨率 (${width}×${height} @ ${safeFps}fps)。建议在右侧开启「720p/540p 流畅模式」降低输出尺寸后再导出。`,
+  );
 }
 
 function extractCodecDescription(mp4: MP4Box.MP4File, trackId: number): Uint8Array | undefined {
@@ -100,78 +107,100 @@ interface DemuxedMp4 {
   audioSamples: MP4Box.MP4Sample[];
 }
 
-function demuxMp4Buffer(arrayBuffer: ArrayBuffer): Promise<DemuxedMp4> {
-  return new Promise((resolve, reject) => {
-    const mp4 = MP4Box.createFile();
-    let videoTrack: MP4Box.MP4Track | null = null;
-    let audioTrack: MP4Box.MP4Track | undefined;
-    const videoSamples: MP4Box.MP4Sample[] = [];
-    const audioSamples: MP4Box.MP4Sample[] = [];
-    let settled = false;
+async function demuxMp4Source(source: VideoSourceMeta): Promise<DemuxedMp4> {
+  const mp4 = MP4Box.createFile();
+  let videoTrack: MP4Box.MP4Track | null = null;
+  let audioTrack: MP4Box.MP4Track | undefined;
+  const videoSamples: MP4Box.MP4Sample[] = [];
+  const audioSamples: MP4Box.MP4Sample[] = [];
+  let parseErr: string | null = null;
 
-    const fail = (msg: string) => {
-      if (settled) return;
-      settled = true;
-      reject(new Error(msg));
-    };
+  mp4.onError = (e) => {
+    parseErr = `MP4 解封装失败: ${e}`;
+  };
 
-    mp4.onError = (e) => fail(`MP4 解封装失败: ${e}`);
+  mp4.onReady = (info) => {
+    if (!info.videoTracks?.length) {
+      parseErr = 'MP4 文件中未找到视频轨';
+      return;
+    }
+    videoTrack = info.videoTracks[0];
+    mp4.setExtractionOptions(videoTrack.id, 'video', {
+      nbSamples: Math.max(1000, videoTrack.nb_samples),
+    });
 
-    mp4.onReady = (info) => {
-      if (!info.videoTracks?.length) {
-        fail('MP4 文件中未找到视频轨');
-        return;
-      }
-      videoTrack = info.videoTracks[0];
-      mp4.setExtractionOptions(videoTrack.id, 'video', { nbSamples: Math.max(1000, videoTrack.nb_samples) });
+    const aTrack = info.audioTracks?.find((t) => t.codec?.toLowerCase().startsWith('mp4a'));
+    if (aTrack && aTrack.audio) {
+      audioTrack = aTrack;
+      mp4.setExtractionOptions(aTrack.id, 'audio', {
+        nbSamples: Math.max(2000, aTrack.nb_samples),
+      });
+    }
+    mp4.start();
+  };
 
-      const aTrack = info.audioTracks?.find((t) => t.codec?.toLowerCase().startsWith('mp4a'));
-      if (aTrack && aTrack.audio) {
-        audioTrack = aTrack;
-        mp4.setExtractionOptions(aTrack.id, 'audio', { nbSamples: Math.max(2000, aTrack.nb_samples) });
-      }
-      mp4.start();
-    };
+  mp4.onSamples = (_trackId, user, samples) => {
+    if (user === 'video') {
+      for (const s of samples) videoSamples.push(s);
+    } else if (user === 'audio') {
+      for (const s of samples) audioSamples.push(s);
+    }
+  };
 
-    mp4.onSamples = (_trackId, user, samples) => {
-      if (user === 'video') {
-        for (const s of samples) videoSamples.push(s);
-      } else if (user === 'audio') {
-        for (const s of samples) audioSamples.push(s);
-      }
-    };
-
-    const mp4Buf = arrayBuffer.slice(0) as MP4Box.MP4ArrayBuffer;
+  if (source.file) {
+    // Stream in 8MB slices to avoid doubling memory on 150MB+ phone recordings
+    const CHUNK = 8 * 1024 * 1024;
+    for (let off = 0; off < source.file.size; off += CHUNK) {
+      const ab = await source.file.slice(off, Math.min(source.file.size, off + CHUNK)).arrayBuffer();
+      const mp4Buf = ab as MP4Box.MP4ArrayBuffer;
+      mp4Buf.fileStart = off;
+      mp4.appendBuffer(mp4Buf);
+      if (parseErr) throw new Error(parseErr);
+    }
+  } else {
+    const resp = await fetch(source.url);
+    if (!resp.ok) throw new Error(`读取演示视频失败 (${resp.status})`);
+    const ab = await resp.arrayBuffer();
+    const mp4Buf = ab as MP4Box.MP4ArrayBuffer;
     mp4Buf.fileStart = 0;
     mp4.appendBuffer(mp4Buf);
-    mp4.flush();
+  }
 
-    // mp4box processes synchronously for complete buffers; finalize on next microtask
-    queueMicrotask(() => {
-      if (settled) return;
-      if (!videoTrack || videoSamples.length === 0) {
-        fail('MP4 中未提取到有效视频帧');
-        return;
-      }
-      settled = true;
-      resolve({
-        videoTrack,
-        videoDescription: extractCodecDescription(mp4, videoTrack.id),
-        videoSamples,
-        audioTrack,
-        audioSamples,
-      });
-    });
-  });
+  mp4.flush();
+  await new Promise((r) => setTimeout(r, 0));
+
+  if (parseErr) throw new Error(parseErr);
+  const vt = videoTrack as MP4Box.MP4Track | null;
+  if (!vt || videoSamples.length === 0) {
+    throw new Error('MP4 中未提取到有效视频帧');
+  }
+  return {
+    videoTrack: vt,
+    videoDescription: extractCodecDescription(mp4, vt.id),
+    videoSamples,
+    audioTrack,
+    audioSamples,
+  };
 }
 
-function makeOutputFileName(sourceName: string, tierLabel: string, scale: number): string {
+function makeOutputFileName(
+  sourceName: string,
+  tierLabel: string,
+  scale: number,
+  clippedSec: number | null,
+): string {
   const base = sourceName.replace(/\.[^.]+$/, '');
   const scaleTag = Math.abs(scale - 1.5) < 1e-3 ? 'x1_5' : 'x2';
-  return `${base}_CodecSR_${tierLabel}_${scaleTag}.mp4`;
+  const clipTag = clippedSec !== null ? `_first${Math.round(clippedSec)}s` : '';
+  return `${base}_CodecSR_${tierLabel}_${scaleTag}${clipTag}.mp4`;
 }
 
-function createExportCanvas(device: GPUDevice, format: GPUTextureFormat, width: number, height: number): {
+function createExportCanvas(
+  device: GPUDevice,
+  format: GPUTextureFormat,
+  width: number,
+  height: number,
+): {
   canvas: HTMLCanvasElement;
   ctx: GPUCanvasContext;
 } {
@@ -192,12 +221,15 @@ function createExportCanvas(device: GPUDevice, format: GPUTextureFormat, width: 
 
 async function exportViaMp4BoxWebCodecs(
   opts: ExportOptions,
-  rawBuffer: ArrayBuffer,
   encW: number,
   encH: number,
 ): Promise<ExportResult> {
-  const { engine, source, bitrateMbps, tierLabel, scale, signal, onProgress } = opts;
+  const { engine, source, workW, workH, bitrateMbps, tierLabel, scale, maxDurationSec, signal, onProgress } = opts;
   const startWall = performance.now();
+  const clippedSec =
+    maxDurationSec && maxDurationSec > 0 && source.durationSec > maxDurationSec + 0.25
+      ? maxDurationSec
+      : null;
 
   onProgress({
     phase: 'demux',
@@ -205,10 +237,10 @@ async function exportViaMp4BoxWebCodecs(
     totalFrames: source.frameCount,
     fps: 0,
     etaSec: 0,
-    message: '正在解封装 MP4 码流...',
+    message: '正在解封装 MP4 / HEVC 码流...',
   });
 
-  const demuxed = await demuxMp4Buffer(rawBuffer);
+  const demuxed = await demuxMp4Source(source);
   if (signal.aborted) throw new DOMException('已取消导出', 'AbortError');
 
   const decoderCfg: VideoDecoderConfig = {
@@ -222,14 +254,45 @@ async function exportViaMp4BoxWebCodecs(
     throw new Error(`VideoDecoder 不支持 ${decoderCfg.codec}`);
   }
 
+  // Filter samples when exporting a time-bounded clip (e.g. first 10s)
+  const firstVideoCtsSec = demuxed.videoSamples[0].cts / demuxed.videoSamples[0].timescale;
+  const maxCtsSec = clippedSec !== null ? firstVideoCtsSec + clippedSec : Number.POSITIVE_INFINITY;
+  const maxUsCutoff = clippedSec !== null ? Math.round((firstVideoCtsSec + clippedSec) * 1_000_000) : Number.POSITIVE_INFINITY;
+
+  // Keep a small B-frame decode margin (+0.5s) then trim exact presentation timestamps on output
+  const feedSamples: MP4Box.MP4Sample[] = [];
+  for (const s of demuxed.videoSamples) {
+    const dtsSec = s.dts / s.timescale;
+    if (clippedSec !== null && dtsSec > maxCtsSec + 0.5 && feedSamples.length > 0) {
+      break;
+    }
+    feedSamples.push(s);
+  }
+
+  const audioSamplesToMux: MP4Box.MP4Sample[] = [];
+  if (demuxed.audioSamples.length > 0) {
+    const firstAudioSec = demuxed.audioSamples[0].cts / demuxed.audioSamples[0].timescale;
+    const maxAudioSec = clippedSec !== null ? firstAudioSec + clippedSec : Number.POSITIVE_INFINITY;
+    for (const a of demuxed.audioSamples) {
+      if (a.cts / a.timescale <= maxAudioSec) {
+        audioSamplesToMux.push(a);
+      }
+    }
+  }
+
   const fps =
     demuxed.videoTrack.duration && demuxed.videoTrack.timescale
       ? demuxed.videoSamples.length / (demuxed.videoTrack.duration / demuxed.videoTrack.timescale)
       : source.fps;
+  const estimatedTargetFrames =
+    clippedSec !== null
+      ? Math.max(1, Math.min(feedSamples.length, Math.round(clippedSec * fps)))
+      : feedSamples.length;
+
   const encoderCfg = await pickH264EncoderConfig(encW, encH, fps, Math.round(bitrateMbps * 1_000_000));
 
   const target = new ArrayBufferTarget();
-  const hasAudio = Boolean(demuxed.audioTrack?.audio && demuxed.audioSamples.length > 0);
+  const hasAudio = Boolean(demuxed.audioTrack?.audio && audioSamplesToMux.length > 0);
   const muxer = new Muxer({
     target,
     video: {
@@ -292,12 +355,10 @@ async function exportViaMp4BoxWebCodecs(
   });
   decoder.configure(decoderCfg);
 
-  const totalFrames = demuxed.videoSamples.length;
   const keyframeInterval = Math.max(15, Math.min(120, Math.round(fps * 2)));
   const defaultDurUs = Math.round(1_000_000 / Math.max(1, fps));
   let processedFrames = 0;
 
-  // Consumer: runs GPU super-resolution & H.264 encode sequentially as frames arrive
   const consumerPromise = (async () => {
     while (true) {
       if (signal.aborted) break;
@@ -314,18 +375,28 @@ async function exportViaMp4BoxWebCodecs(
       }
 
       try {
+        if (clippedSec !== null && frame.timestamp > maxUsCutoff) {
+          continue;
+        }
         const w = frame.displayWidth || frame.codedWidth;
         const h = frame.displayHeight || frame.codedHeight;
-        engine.processFrame(frame, w, h, false, {
-          ctx: exportCtx,
-          opts: {
-            splitX: 0,
-            viewMode: 1,
-            zoom: 1,
-            centerX: 0.5,
-            centerY: 0.5,
+        engine.processFrame(
+          frame,
+          w,
+          h,
+          false,
+          {
+            ctx: exportCtx,
+            opts: {
+              splitX: 0,
+              viewMode: 1,
+              zoom: 1,
+              centerX: 0.5,
+              centerY: 0.5,
+            },
           },
-        });
+          { workW, workH },
+        );
         await engine.waitGpuIdle();
 
         while (encoder.encodeQueueSize > 8 && !signal.aborted && !encoderError) {
@@ -344,14 +415,15 @@ async function exportViaMp4BoxWebCodecs(
 
         const elapsedSec = Math.max(0.01, (performance.now() - startWall) / 1000);
         const curFps = processedFrames / elapsedSec;
-        const etaSec = curFps > 0 ? Math.max(0, (totalFrames - processedFrames) / curFps) : 0;
+        const totalEst = Math.max(processedFrames, estimatedTargetFrames);
+        const etaSec = curFps > 0 ? Math.max(0, (totalEst - processedFrames) / curFps) : 0;
         onProgress({
           phase: 'processing',
           doneFrames: processedFrames,
-          totalFrames,
+          totalFrames: totalEst,
           fps: curFps,
           etaSec,
-          message: `本地 WebGPU 超分渲染中 (${processedFrames}/${totalFrames} 帧)`,
+          message: `本地 WebGPU 超分渲染中 (${processedFrames}/${totalEst} 帧)`,
         });
       } finally {
         frame.close();
@@ -359,9 +431,8 @@ async function exportViaMp4BoxWebCodecs(
     }
   })();
 
-  // Producer: feeds MP4 demuxed chunks with gentle backpressure
   try {
-    for (let i = 0; i < demuxed.videoSamples.length; i++) {
+    for (let i = 0; i < feedSamples.length; i++) {
       if (signal.aborted) throw new DOMException('已取消导出', 'AbortError');
       if (decoderError) throw decoderError;
       if (encoderError) throw encoderError;
@@ -371,7 +442,7 @@ async function exportViaMp4BoxWebCodecs(
       }
       if (signal.aborted) throw new DOMException('已取消导出', 'AbortError');
 
-      const s = demuxed.videoSamples[i];
+      const s = feedSamples[i];
       const chunk = new EncodedVideoChunk({
         type: s.is_sync ? 'key' : 'delta',
         timestamp: Math.round((s.cts * 1_000_000) / s.timescale),
@@ -395,7 +466,7 @@ async function exportViaMp4BoxWebCodecs(
     onProgress({
       phase: 'flushing',
       doneFrames: processedFrames,
-      totalFrames,
+      totalFrames: processedFrames,
       fps: processedFrames / Math.max(0.01, (performance.now() - startWall) / 1000),
       etaSec: 0,
       message: '正在封装最终 MP4 文件...',
@@ -403,8 +474,8 @@ async function exportViaMp4BoxWebCodecs(
 
     await encoder.flush();
 
-    if (hasAudio && demuxed.audioSamples.length > 0) {
-      for (const a of demuxed.audioSamples) {
+    if (hasAudio && audioSamplesToMux.length > 0) {
+      for (const a of audioSamplesToMux) {
         const tsUs = Math.round((a.cts * 1_000_000) / a.timescale);
         const durUs = Math.round((a.duration * 1_000_000) / a.timescale);
         muxer.addAudioChunkRaw(a.data, 'key', tsUs, durUs);
@@ -432,13 +503,14 @@ async function exportViaMp4BoxWebCodecs(
   const res: ExportResult = {
     blob,
     url: URL.createObjectURL(blob),
-    fileName: makeOutputFileName(source.name, tierLabel, scale),
+    fileName: makeOutputFileName(source.name, tierLabel, scale, clippedSec),
     width: encW,
     height: encH,
     frameCount: processedFrames,
     elapsedSec,
     avgFps: processedFrames / elapsedSec,
     hasAudio,
+    clippedToSec: clippedSec,
     pipelineUsed: 'webcodecs-mp4box',
   };
 
@@ -458,11 +530,16 @@ async function exportViaVideoElementFallback(
   encW: number,
   encH: number,
 ): Promise<ExportResult> {
-  const { engine, source, bitrateMbps, tierLabel, scale, signal, onProgress } = opts;
+  const { engine, source, workW, workH, bitrateMbps, tierLabel, scale, maxDurationSec, signal, onProgress } = opts;
   const startWall = performance.now();
+  const clippedSec =
+    maxDurationSec && maxDurationSec > 0 && source.durationSec > maxDurationSec + 0.25
+      ? maxDurationSec
+      : null;
+  const targetDurSec = clippedSec ?? source.durationSec;
 
   const fps = Math.max(1, Math.min(60, Math.round(source.fps || 30)));
-  const totalFrames = Math.max(1, Math.floor(source.durationSec * fps));
+  const totalFrames = Math.max(1, Math.floor(targetDurSec * fps));
   const encoderCfg = await pickH264EncoderConfig(encW, encH, fps, Math.round(bitrateMbps * 1_000_000));
 
   const target = new ArrayBufferTarget();
@@ -510,7 +587,7 @@ async function exportViaVideoElementFallback(
       if (signal.aborted) throw new DOMException('已取消导出', 'AbortError');
       if (encoderError) throw encoderError;
 
-      const tSec = Math.min(source.durationSec - 0.001, i * stepSec);
+      const tSec = Math.min(Math.max(0, source.durationSec - 0.001), i * stepSec);
       await new Promise<void>((resolve) => {
         const onSeeked = () => {
           video.removeEventListener('seeked', onSeeked);
@@ -520,16 +597,23 @@ async function exportViaVideoElementFallback(
         video.currentTime = Math.max(0, tSec);
       });
 
-      engine.processFrame(video, video.videoWidth, video.videoHeight, false, {
-        ctx: exportCtx,
-        opts: {
-          splitX: 0,
-          viewMode: 1,
-          zoom: 1,
-          centerX: 0.5,
-          centerY: 0.5,
+      engine.processFrame(
+        video,
+        video.videoWidth,
+        video.videoHeight,
+        false,
+        {
+          ctx: exportCtx,
+          opts: {
+            splitX: 0,
+            viewMode: 1,
+            zoom: 1,
+            centerX: 0.5,
+            centerY: 0.5,
+          },
         },
-      });
+        { workW, workH },
+      );
       await engine.waitGpuIdle();
 
       while (encoder.encodeQueueSize > 8 && !signal.aborted && !encoderError) {
@@ -561,7 +645,7 @@ async function exportViaVideoElementFallback(
     onProgress({
       phase: 'flushing',
       doneFrames: processed,
-      totalFrames,
+      totalFrames: processed,
       fps: processed / Math.max(0.01, (performance.now() - startWall) / 1000),
       etaSec: 0,
       message: '正在封装最终 MP4 文件...',
@@ -583,13 +667,14 @@ async function exportViaVideoElementFallback(
   const res: ExportResult = {
     blob,
     url: URL.createObjectURL(blob),
-    fileName: makeOutputFileName(source.name, tierLabel, scale),
+    fileName: makeOutputFileName(source.name, tierLabel, scale, clippedSec),
     width: encW,
     height: encH,
     frameCount: processed,
     elapsedSec,
     avgFps: processed / elapsedSec,
     hasAudio: false,
+    clippedToSec: clippedSec,
     pipelineUsed: 'video-element-fallback',
   };
   onProgress({
@@ -604,36 +689,25 @@ async function exportViaVideoElementFallback(
 }
 
 /**
- * Exports the entire video super-resolved with local WebGPU into a downloadable H.264 MP4.
- * Uses zero-skip MP4Box + WebCodecs VideoDecoder when possible, with automatic fallback for non-MP4 formats.
+ * Exports the video super-resolved with local WebGPU into a downloadable H.264 MP4.
+ * - Uses chunked MP4Box + WebCodecs VideoDecoder (H.264 / HEVC / VP9 / AV1) when unrotated & supported.
+ * - Automatically falls back to browser-rotated <video> stepping for MOV/WebM/rotated phone clips.
+ * - Supports optional `maxDurationSec` (e.g. first 10s fast clip export).
  */
 export async function exportSuperResolvedMp4(opts: ExportOptions): Promise<ExportResult> {
-  const rawOutW = Math.round(opts.source.width * opts.scale);
-  const rawOutH = Math.round(opts.source.height * opts.scale);
-  // H.264 requires even dimensions
+  const rawOutW = Math.round(opts.workW * opts.scale);
+  const rawOutH = Math.round(opts.workH * opts.scale);
+  // H.264 strictly requires even dimensions
   const encW = Math.max(16, rawOutW & ~1);
   const encH = Math.max(16, rawOutH & ~1);
 
-  let rawBuffer: ArrayBuffer | null = null;
-  try {
-    if (opts.source.file) {
-      rawBuffer = await opts.source.file.arrayBuffer();
-    } else {
-      const resp = await fetch(opts.source.url);
-      if (resp.ok) rawBuffer = await resp.arrayBuffer();
-    }
-  } catch {
-    rawBuffer = null;
-  }
-
-  if (rawBuffer && typeof VideoDecoder !== 'undefined') {
+  if (typeof VideoDecoder !== 'undefined' && !opts.source.isRotated) {
     try {
-      return await exportViaMp4BoxWebCodecs(opts, rawBuffer, encW, encH);
+      return await exportViaMp4BoxWebCodecs(opts, encW, encH);
     } catch (err) {
       if (opts.signal.aborted || (err instanceof DOMException && err.name === 'AbortError')) {
         throw err;
       }
-      // Fall back to universal <video> stepping for WebM/MOV or tricky MP4 profiles
       console.warn('[CodecSR Export] MP4Box/VideoDecoder path failed, falling back to <video> stepping:', err);
     }
   }
