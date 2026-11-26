@@ -1,0 +1,175 @@
+{
+  "exported": [
+    {
+      "source_ckpt": "/root/workspace/video-chaofen/checkpoints/v3/client_L_540p_noprior_best.pt",
+      "deploy_ckpt": "/root/workspace/video-chaofen/outputs/v3/exported/client_L_540p_noprior_best_deploy.pt",
+      "tier": "L",
+      "scale": 2.0,
+      "arch_version": "v3",
+      "prior_dim": 7,
+      "stats": {
+        "params": 18278,
+        "params_k": 18.28,
+        "gmacs": 1.568
+      },
+      "fold_max_abs_err": 0.0,
+      "prior_bake_max_abs_err": 0.0,
+      "fp16_vs_fp32_psnr": 61.1,
+      "baked_fp16_vs_fp32_psnr": 61.1
+    },
+    {
+      "source_ckpt": "/root/workspace/video-chaofen/checkpoints/v3/client_L_540p_prior_best.pt",
+      "deploy_ckpt": "/root/workspace/video-chaofen/outputs/v3/exported/client_L_540p_prior_best_deploy.pt",
+      "tier": "L",
+      "scale": 2.0,
+      "arch_version": "v3",
+      "prior_dim": 7,
+      "stats": {
+        "params": 70862,
+        "params_k": 70.86,
+        "gmacs": 1.568
+      },
+      "fold_max_abs_err": 0.0,
+      "prior_bake_max_abs_err": 7.152557373046875e-07,
+      "fp16_vs_fp32_psnr": 60.92,
+      "baked_fp16_vs_fp32_psnr": 61.42
+    },
+    {
+      "source_ckpt": "/root/workspace/video-chaofen/checkpoints/v3/client_L_720p_noprior_best.pt",
+      "deploy_ckpt": "/root/workspace/video-chaofen/outputs/v3/exported/client_L_720p_noprior_best_deploy.pt",
+      "tier": "L",
+      "scale": 1.5,
+      "arch_version": "v3",
+      "prior_dim": 7,
+      "stats": {
+        "params": 17263,
+        "params_k": 17.26,
+        "gmacs": 2.555
+      },
+      "fold_max_abs_err": 0.0,
+      "prior_bake_max_abs_err": 0.0,
+      "fp16_vs_fp32_psnr": 61.62,
+      "baked_fp16_vs_fp32_psnr": 61.62
+    },
+    {
+      "source_ckpt": "/root/workspace/video-chaofen/checkpoints/v3/client_L_720p_prior_best.pt",
+      "deploy_ckpt": "/root/workspace/video-chaofen/outputs/v3/exported/client_L_720p_prior_best_deploy.pt",
+      "tier": "L",
+      "scale": 1.5,
+      "arch_version": "v3",
+      "prior_dim": 7,
+      "stats": {
+        "params": 65549,
+        "params_k": 65.55,
+        "gmacs": 2.555
+      },
+      "fold_max_abs_err": 0.0,
+      "prior_bake_max_abs_err": 7.748603820800781e-07,
+      "fp16_vs_fp32_psnr": 60.97,
+      "baked_fp16_vs_fp32_psnr": 61.62
+    },
+    {
+      "source_ckpt": "/root/workspace/video-chaofen/checkpoints/v3/client_P_540p_prior_best.pt",
+      "deploy_ckpt": "/root/workspace/video-chaofen/outputs/v3/exported/client_P_540p_prior_best_deploy.pt",
+      "tier": "P",
+      "scale": 2.0,
+      "arch_version": "v3",
+      "prior_dim": 7,
+      "stats": {
+        "params": 205389,
+        "params_k": 205.39,
+        "gmacs": 23.907
+      },
+      "fold_max_abs_err": 0.0,
+      "prior_bake_max_abs_err": 7.152557373046875e-07,
+      "fp16_vs_fp32_psnr": 60.95,
+      "baked_fp16_vs_fp32_psnr": 61.69
+    },
+    {
+      "source_ckpt": "/root/workspace/video-chaofen/checkpoints/v3/client_P_720p_prior_best.pt",
+      "deploy_ckpt": "/root/workspace/video-chaofen/outputs/v3/exported/client_P_720p_prior_best_deploy.pt",
+      "tier": "P",
+      "scale": 1.5,
+      "arch_version": "v3",
+      "prior_dim": 7,
+      "stats": {
+        "params": 200265,
+        "params_k": 200.26,
+        "gmacs": 37.424
+      },
+      "fold_max_abs_err": 0.0,
+      "prior_bake_max_abs_err": 8.344650268554688e-07,
+      "fp16_vs_fp32_psnr": 60.73,
+      "baked_fp16_vs_fp32_psnr": 61.46
+    },
+    {
+      "source_ckpt": "/root/workspace/video-chaofen/checkpoints/v3/client_S_540p_noprior_best.pt",
+      "deploy_ckpt": "/root/workspace/video-chaofen/outputs/v3/exported/client_S_540p_noprior_best_deploy.pt",
+      "tier": "S",
+      "scale": 2.0,
+      "arch_version": "v3",
+      "prior_dim": 7,
+      "stats": {
+        "params": 47446,
+        "params_k": 47.45,
+        "gmacs": 5.225
+      },
+      "fold_max_abs_err": 0.0,
+      "prior_bake_max_abs_err": 0.0,
+      "fp16_vs_fp32_psnr": 61.15,
+      "baked_fp16_vs_fp32_psnr": 61.16
+    },
+    {
+      "source_ckpt": "/root/workspace/video-chaofen/checkpoints/v3/client_S_540p_prior_best.pt",
+      "deploy_ckpt": "/root/workspace/video-chaofen/outputs/v3/exported/client_S_540p_prior_best_deploy.pt",
+      "tier": "S",
+      "scale": 2.0,
+      "arch_version": "v3",
+      "prior_dim": 7,
+      "stats": {
+        "params": 145778,
+        "params_k": 145.78,
+        "gmacs": 5.225
+      },
+      "fold_max_abs_err": 0.0,
+      "prior_bake_max_abs_err": 1.1324882507324219e-06,
+      "fp16_vs_fp32_psnr": 60.74,
+      "baked_fp16_vs_fp32_psnr": 61.24
+    },
+    {
+      "source_ckpt": "/root/workspace/video-chaofen/checkpoints/v3/client_S_720p_noprior_best.pt",
+      "deploy_ckpt": "/root/workspace/video-chaofen/outputs/v3/exported/client_S_720p_noprior_best_deploy.pt",
+      "tier": "S",
+      "scale": 1.5,
+      "arch_version": "v3",
+      "prior_dim": 7,
+      "stats": {
+        "params": 35543,
+        "params_k": 35.54,
+        "gmacs": 6.619
+      },
+      "fold_max_abs_err": 0.0,
+      "prior_bake_max_abs_err": 0.0,
+      "fp16_vs_fp32_psnr": 61.16,
+      "baked_fp16_vs_fp32_psnr": 61.16
+    },
+    {
+      "source_ckpt": "/root/workspace/video-chaofen/checkpoints/v3/client_S_720p_prior_best.pt",
+      "deploy_ckpt": "/root/workspace/video-chaofen/outputs/v3/exported/client_S_720p_prior_best_deploy.pt",
+      "tier": "S",
+      "scale": 1.5,
+      "arch_version": "v3",
+      "prior_dim": 7,
+      "stats": {
+        "params": 105049,
+        "params_k": 105.05,
+        "gmacs": 6.619
+      },
+      "fold_max_abs_err": 0.0,
+      "prior_bake_max_abs_err": 8.940696716308594e-07,
+      "fp16_vs_fp32_psnr": 61.01,
+      "baked_fp16_vs_fp32_psnr": 61.54
+    }
+  ],
+  "errors": []
+}

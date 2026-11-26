@@ -1,0 +1,138 @@
+{
+  "gl_version": "OpenGL ES 3.2 Mesa 25.2.8-0ubuntu0.24.04.4",
+  "gl_vendor": "Mesa",
+  "gl_renderer": "llvmpipe (LLVM 20.1.2, 256 bits)",
+  "shader": "/root/workspace/video-chaofen/client_sdk/shaders/client_sr_v3.comp",
+  "verified": [
+    {
+      "bin": "/root/workspace/video-chaofen/outputs/v3/shaders/client_L_540p_noprior.bin",
+      "tier": "L",
+      "scale": 2.0,
+      "use_prior": false,
+      "patch_lr": 64,
+      "patch_sr": [
+        128,
+        128
+      ],
+      "gles_vs_pytorch_fp16_psnr_db": 74.32,
+      "max_abs_err": 0.0008
+    },
+    {
+      "bin": "/root/workspace/video-chaofen/outputs/v3/shaders/client_L_540p_prior.bin",
+      "tier": "L",
+      "scale": 2.0,
+      "use_prior": true,
+      "patch_lr": 64,
+      "patch_sr": [
+        128,
+        128
+      ],
+      "gles_vs_pytorch_fp16_psnr_db": 74.58,
+      "max_abs_err": 0.00071
+    },
+    {
+      "bin": "/root/workspace/video-chaofen/outputs/v3/shaders/client_L_720p_noprior.bin",
+      "tier": "L",
+      "scale": 1.5,
+      "use_prior": false,
+      "patch_lr": 64,
+      "patch_sr": [
+        96,
+        96
+      ],
+      "gles_vs_pytorch_fp16_psnr_db": 73.74,
+      "max_abs_err": 0.000817
+    },
+    {
+      "bin": "/root/workspace/video-chaofen/outputs/v3/shaders/client_L_720p_prior.bin",
+      "tier": "L",
+      "scale": 1.5,
+      "use_prior": true,
+      "patch_lr": 64,
+      "patch_sr": [
+        96,
+        96
+      ],
+      "gles_vs_pytorch_fp16_psnr_db": 74.03,
+      "max_abs_err": 0.000934
+    },
+    {
+      "bin": "/root/workspace/video-chaofen/outputs/v3/shaders/client_P_540p_prior.bin",
+      "tier": "P",
+      "scale": 2.0,
+      "use_prior": true,
+      "patch_lr": 64,
+      "patch_sr": [
+        128,
+        128
+      ],
+      "gles_vs_pytorch_fp16_psnr_db": 75.19,
+      "max_abs_err": 0.000667
+    },
+    {
+      "bin": "/root/workspace/video-chaofen/outputs/v3/shaders/client_P_720p_prior.bin",
+      "tier": "P",
+      "scale": 1.5,
+      "use_prior": true,
+      "patch_lr": 64,
+      "patch_sr": [
+        96,
+        96
+      ],
+      "gles_vs_pytorch_fp16_psnr_db": 74.45,
+      "max_abs_err": 0.000692
+    },
+    {
+      "bin": "/root/workspace/video-chaofen/outputs/v3/shaders/client_S_540p_noprior.bin",
+      "tier": "S",
+      "scale": 2.0,
+      "use_prior": false,
+      "patch_lr": 64,
+      "patch_sr": [
+        128,
+        128
+      ],
+      "gles_vs_pytorch_fp16_psnr_db": 73.95,
+      "max_abs_err": 0.000839
+    },
+    {
+      "bin": "/root/workspace/video-chaofen/outputs/v3/shaders/client_S_540p_prior.bin",
+      "tier": "S",
+      "scale": 2.0,
+      "use_prior": true,
+      "patch_lr": 64,
+      "patch_sr": [
+        128,
+        128
+      ],
+      "gles_vs_pytorch_fp16_psnr_db": 74.56,
+      "max_abs_err": 0.000755
+    },
+    {
+      "bin": "/root/workspace/video-chaofen/outputs/v3/shaders/client_S_720p_noprior.bin",
+      "tier": "S",
+      "scale": 1.5,
+      "use_prior": false,
+      "patch_lr": 64,
+      "patch_sr": [
+        96,
+        96
+      ],
+      "gles_vs_pytorch_fp16_psnr_db": 73.78,
+      "max_abs_err": 0.000779
+    },
+    {
+      "bin": "/root/workspace/video-chaofen/outputs/v3/shaders/client_S_720p_prior.bin",
+      "tier": "S",
+      "scale": 1.5,
+      "use_prior": true,
+      "patch_lr": 64,
+      "patch_sr": [
+        96,
+        96
+      ],
+      "gles_vs_pytorch_fp16_psnr_db": 74.24,
+      "max_abs_err": 0.000768
+    }
+  ]
+}

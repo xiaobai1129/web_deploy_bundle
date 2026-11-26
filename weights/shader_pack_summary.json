@@ -1,0 +1,85 @@
+{
+  "blobs": [
+    {
+      "out_bin": "/root/workspace/video-chaofen/outputs/v3/shaders/client_L_540p_noprior.bin",
+      "size_kb": 38.02,
+      "num_tensors": 24,
+      "out_int8_bin": "/root/workspace/video-chaofen/outputs/v3/shaders/client_L_540p_noprior.int8.bin",
+      "int8_size_kb": 27.02,
+      "int8_vs_fp32_psnr": 46.3
+    },
+    {
+      "out_bin": "/root/workspace/video-chaofen/outputs/v3/shaders/client_L_540p_prior.bin",
+      "size_kb": 142.59,
+      "num_tensors": 44,
+      "out_int8_bin": "/root/workspace/video-chaofen/outputs/v3/shaders/client_L_540p_prior.int8.bin",
+      "int8_size_kb": 82.96,
+      "int8_vs_fp32_psnr": 43.95
+    },
+    {
+      "out_bin": "/root/workspace/video-chaofen/outputs/v3/shaders/client_L_720p_noprior.bin",
+      "size_kb": 36.03,
+      "num_tensors": 24,
+      "out_int8_bin": "/root/workspace/video-chaofen/outputs/v3/shaders/client_L_720p_noprior.int8.bin",
+      "int8_size_kb": 26.0,
+      "int8_vs_fp32_psnr": 46.4
+    },
+    {
+      "out_bin": "/root/workspace/video-chaofen/outputs/v3/shaders/client_L_720p_prior.bin",
+      "size_kb": 132.21,
+      "num_tensors": 44,
+      "out_int8_bin": "/root/workspace/video-chaofen/outputs/v3/shaders/client_L_720p_prior.int8.bin",
+      "int8_size_kb": 77.62,
+      "int8_vs_fp32_psnr": 46.94
+    },
+    {
+      "out_bin": "/root/workspace/video-chaofen/outputs/v3/shaders/client_P_540p_prior.bin",
+      "size_kb": 407.04,
+      "num_tensors": 62,
+      "out_int8_bin": "/root/workspace/video-chaofen/outputs/v3/shaders/client_P_540p_prior.int8.bin",
+      "int8_size_kb": 220.19,
+      "int8_vs_fp32_psnr": 44.75
+    },
+    {
+      "out_bin": "/root/workspace/video-chaofen/outputs/v3/shaders/client_P_720p_prior.bin",
+      "size_kb": 395.68,
+      "num_tensors": 48,
+      "out_int8_bin": "/root/workspace/video-chaofen/outputs/v3/shaders/client_P_720p_prior.int8.bin",
+      "int8_size_kb": 212.36,
+      "int8_vs_fp32_psnr": 37.94
+    },
+    {
+      "out_bin": "/root/workspace/video-chaofen/outputs/v3/shaders/client_S_540p_noprior.bin",
+      "size_kb": 95.28,
+      "num_tensors": 27,
+      "out_int8_bin": "/root/workspace/video-chaofen/outputs/v3/shaders/client_S_540p_noprior.int8.bin",
+      "int8_size_kb": 57.0,
+      "int8_vs_fp32_psnr": 43.9
+    },
+    {
+      "out_bin": "/root/workspace/video-chaofen/outputs/v3/shaders/client_S_540p_prior.bin",
+      "size_kb": 289.41,
+      "num_tensors": 49,
+      "out_int8_bin": "/root/workspace/video-chaofen/outputs/v3/shaders/client_S_540p_prior.int8.bin",
+      "int8_size_kb": 159.48,
+      "int8_vs_fp32_psnr": 41.46
+    },
+    {
+      "out_bin": "/root/workspace/video-chaofen/outputs/v3/shaders/client_S_720p_noprior.bin",
+      "size_kb": 72.03,
+      "num_tensors": 27,
+      "out_int8_bin": "/root/workspace/video-chaofen/outputs/v3/shaders/client_S_720p_noprior.int8.bin",
+      "int8_size_kb": 45.0,
+      "int8_vs_fp32_psnr": 45.5
+    },
+    {
+      "out_bin": "/root/workspace/video-chaofen/outputs/v3/shaders/client_S_720p_prior.bin",
+      "size_kb": 209.85,
+      "num_tensors": 49,
+      "out_int8_bin": "/root/workspace/video-chaofen/outputs/v3/shaders/client_S_720p_prior.int8.bin",
+      "int8_size_kb": 118.76,
+      "int8_vs_fp32_psnr": 44.38
+    }
+  ],
+  "errors": []
+}
