@@ -91,7 +91,8 @@ export default function App() {
   // Refs for latest render parameters (for zero-overhead canvas redraws & rVFC callbacks)
   const displayOptsRef = useRef({ splitX, viewMode, zoom, centerX, centerY });
   displayOptsRef.current = { splitX, viewMode, zoom, centerX, centerY };
-  const frameBusyRef = useRef(false);
+  const inFlightGpuRef = useRef(0);
+  const lastTelemetryAtRef = useRef(0);
   const exportingRef = useRef(false);
   exportingRef.current = exporting;
 
@@ -126,17 +127,17 @@ export default function App() {
     engine.renderToCanvas(ctx, displayOptsRef.current);
   }, []);
 
-  // Process the current <video> frame through WebGPU SR and display it
-  const processAndDisplayCurrentFrame = useCallback(async () => {
+  // Process the current <video> frame through WebGPU SR and display it in a SINGLE non-blocking GPU submit
+  const processAndDisplayCurrentFrame = useCallback(() => {
     const engine = engineRef.current;
     const video = videoRef.current;
     const canvas = canvasRef.current;
     if (!engine || !video || !canvas || exportingRef.current) return;
     if (video.readyState < 2 || video.videoWidth <= 0 || video.videoHeight <= 0) return;
     if (!engine.getActiveBaked()) return;
-    if (frameBusyRef.current) return;
+    // Allow 1 frame in flight to keep GPU pipelined without queuing latency spikes
+    if (inFlightGpuRef.current >= 1) return;
 
-    frameBusyRef.current = true;
     try {
       let ctx = canvasCtxRef.current;
       if (!ctx) {
@@ -150,21 +151,41 @@ export default function App() {
         canvasCtxRef.current = ctx;
       }
 
-      const t0 = performance.now();
-      const { outW, outH } = engine.processFrame(video, video.videoWidth, video.videoHeight, true);
-      if (canvas.width !== outW || canvas.height !== outH) {
-        canvas.width = outW;
-        canvas.height = outH;
+      const baked = engine.getActiveBaked()!;
+      const targetOutW = Math.round(video.videoWidth * baked.scalars.scale);
+      const targetOutH = Math.round(video.videoHeight * baked.scalars.scale);
+      if (canvas.width !== targetOutW || canvas.height !== targetOutH) {
+        canvas.width = targetOutW;
+        canvas.height = targetOutH;
       }
-      engine.renderToCanvas(ctx, displayOptsRef.current);
-      await engine.waitGpuIdle();
-      const elapsed = performance.now() - t0;
-      setInferenceMs((prev) => (prev === 0 ? elapsed : prev * 0.7 + elapsed * 0.3));
+
+      const t0 = performance.now();
+      inFlightGpuRef.current++;
+      engine.processFrame(video, video.videoWidth, video.videoHeight, true, {
+        ctx,
+        opts: displayOptsRef.current,
+      });
+
+      engine
+        .waitGpuIdle()
+        .then(() => {
+          const elapsed = performance.now() - t0;
+          const now = performance.now();
+          // Throttle React state update to ~10 Hz during smooth 60fps playback (always update first frame)
+          if (lastTelemetryAtRef.current === 0 || now - lastTelemetryAtRef.current > 100) {
+            lastTelemetryAtRef.current = now;
+            setInferenceMs((prev) => (prev === 0 ? elapsed : prev * 0.75 + elapsed * 0.25));
+          }
+        })
+        .catch(() => {})
+        .finally(() => {
+          inFlightGpuRef.current = Math.max(0, inFlightGpuRef.current - 1);
+        });
+
       setRuntimeError(null);
     } catch (err) {
+      inFlightGpuRef.current = Math.max(0, inFlightGpuRef.current - 1);
       setRuntimeError(err instanceof Error ? err.message : String(err));
-    } finally {
-      frameBusyRef.current = false;
     }
   }, []);
 
@@ -178,6 +199,7 @@ export default function App() {
     setCurrentTime(0);
     setDuration(src.durationSec);
     setInferenceMs(0);
+    lastTelemetryAtRef.current = 0;
     setZoom(1);
     setCenterX(0.5);
     setCenterY(0.5);

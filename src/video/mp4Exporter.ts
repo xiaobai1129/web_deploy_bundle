@@ -316,13 +316,15 @@ async function exportViaMp4BoxWebCodecs(
       try {
         const w = frame.displayWidth || frame.codedWidth;
         const h = frame.displayHeight || frame.codedHeight;
-        engine.processFrame(frame, w, h, false);
-        engine.renderToCanvas(exportCtx, {
-          splitX: 0,
-          viewMode: 1,
-          zoom: 1,
-          centerX: 0.5,
-          centerY: 0.5,
+        engine.processFrame(frame, w, h, false, {
+          ctx: exportCtx,
+          opts: {
+            splitX: 0,
+            viewMode: 1,
+            zoom: 1,
+            centerX: 0.5,
+            centerY: 0.5,
+          },
         });
         await engine.waitGpuIdle();
 
@@ -518,13 +520,15 @@ async function exportViaVideoElementFallback(
         video.currentTime = Math.max(0, tSec);
       });
 
-      engine.processFrame(video, video.videoWidth, video.videoHeight, false);
-      engine.renderToCanvas(exportCtx, {
-        splitX: 0,
-        viewMode: 1,
-        zoom: 1,
-        centerX: 0.5,
-        centerY: 0.5,
+      engine.processFrame(video, video.videoWidth, video.videoHeight, false, {
+        ctx: exportCtx,
+        opts: {
+          splitX: 0,
+          viewMode: 1,
+          zoom: 1,
+          centerX: 0.5,
+          centerY: 0.5,
+        },
       });
       await engine.waitGpuIdle();
 

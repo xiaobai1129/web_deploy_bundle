@@ -1,5 +1,6 @@
 import { bakeCsr1ToSsbo, parseBinaryBlob, type BakedSsboResult, type ParsedBlob } from '../core/csr1';
-import clientSrWgsl from './shaders/clientSrV3.wgsl?raw';
+import { packFastWeights, type PackedFastWeights } from '../core/packFastWeights';
+import clientSrFastWgsl from './shaders/clientSrV3Fast.wgsl?raw';
 import colorCompareWgsl from './shaders/colorAndCompare.wgsl?raw';
 
 export type CompareViewMode = 0 | 1 | 2 | 3; // 0=split, 1=sr, 2=bicubic, 3=heatmap
@@ -20,29 +21,36 @@ export interface GpuDeviceSummary {
   maxBufferSize: number;
 }
 
-interface DispatchSpec {
-  op: number;
-  inC: number;
-  inH: number;
-  inW: number;
-  outC: number;
-  outH: number;
-  outW: number;
-  bufA: GPUBuffer;
-  bufB: GPUBuffer;
-  dst: GPUBuffer;
-  wOff?: number;
-  bOff?: number;
-  pbOff?: number;
-  actOff?: number;
-  hasPb?: number;
-  hasAct?: number;
-  scaleR?: number;
-  addB?: number;
-  alpha?: number;
-  beta?: number;
-  delta?: number;
+type FastKernelKey =
+  | 'bicubic'
+  | 'unshuffle2_scalar'
+  | 'unshuffle2_c4'
+  | 'conv3x3_scalar'
+  | 'conv3x3_c4'
+  | 'span_combine_c4'
+  | 'shuffle_to_scalar'
+  | 'shuffle2_c4'
+  | 'seam_lut_lr'
+  | 'add_seam_trust_clamp';
+
+interface CachedDispatch {
+  kind: 'compute';
+  kernel: FastKernelKey;
+  bindGroup: GPUBindGroup;
+  slotOffset: number;
+  gx: number;
+  gy: number;
+  gz: number;
 }
+
+interface CachedCopy {
+  kind: 'copy';
+  src: GPUBuffer;
+  dst: GPUBuffer;
+  bytes: number;
+}
+
+type PlanStep = CachedDispatch | CachedCopy;
 
 interface FrameWorkspace {
   srcW: number;
@@ -54,10 +62,12 @@ interface FrameWorkspace {
   outW: number;
   outH: number;
   scratchBytes: number;
+  modelSignature: string;
   srcTex: GPUTexture;
   srTex: GPUTexture;
   bicubicTex: GPUTexture;
   xBuf: GPUBuffer;
+  seamLrBuf: GPUBuffer;
   baseBuf: GPUBuffer;
   resBuf: GPUBuffer;
   fHeadBuf: GPUBuffer;
@@ -70,6 +80,10 @@ interface FrameWorkspace {
   rgb2yBindGroup: GPUBindGroup;
   y2rgbSrBindGroup: GPUBindGroup;
   y2rgbBiBindGroup: GPUBindGroup;
+  displayLinearBindGroup: GPUBindGroup;
+  displayNearestBindGroup: GPUBindGroup;
+  planSteps: PlanStep[];
+  planSlotCount: number;
 }
 
 const MAX_DISPATCH_SLOTS = 32;
@@ -87,11 +101,16 @@ function computeRequiredScratchBytes(
   const s = baked.scalars;
   let maxFloats = srPadH * srPadW;
   if (s.isHourglass) {
-    const maxMidC = Math.max(4 * s.stemCh, s.midCh, s.upOutCh, 9);
-    maxFloats = Math.max(maxFloats, maxMidC * uh * uw, Math.max(s.stemCh, 4) * padH * padW);
+    const stemC4 = Math.ceil(s.stemCh / 4) * 4;
+    const midC4 = Math.ceil(s.midCh / 4) * 4;
+    const upC4 = Math.ceil(s.upOutCh / 4) * 4;
+    const maxMidC = Math.max(4 * stemC4, midC4, upC4, 12);
+    maxFloats = Math.max(maxFloats, maxMidC * uh * uw, Math.max(stemC4, 4) * padH * padW);
   } else {
     const rTail = Math.abs(s.scale - 2.0) < 1e-4 ? 4 : 3;
-    const maxMidC = Math.max(4, s.midCh, rTail * rTail);
+    const tailC4 = Math.ceil((rTail * rTail) / 4) * 4;
+    const midC4 = Math.ceil(s.midCh / 4) * 4;
+    const maxMidC = Math.max(4, midC4, tailC4);
     maxFloats = Math.max(maxFloats, maxMidC * uh * uw);
   }
   return Math.max(256, maxFloats * 4);
@@ -103,7 +122,7 @@ export class CodecSREngine {
   readonly gpuInfo: GpuDeviceSummary;
 
   private readonly srBindGroupLayout: GPUBindGroupLayout;
-  private readonly srPipeline: GPUComputePipeline;
+  private readonly kernels: Record<FastKernelKey, GPUComputePipeline>;
   private readonly rgb2yPipeline: GPUComputePipeline;
   private readonly y2rgbPipeline: GPUComputePipeline;
   private readonly displayPipeline: GPURenderPipeline;
@@ -116,10 +135,13 @@ export class CodecSREngine {
   private readonly paramsU32: Uint32Array;
   private readonly paramsF32: Float32Array;
   private readonly displayUniformBuf: GPUBuffer;
+  private readonly displayUniformStaging = new ArrayBuffer(32);
 
   private readonly blobCache = new Map<string, ParsedBlob>();
   private weightBuf: GPUBuffer | null = null;
+  private weightBufGeneration = 0;
   private activeBaked: BakedSsboResult | null = null;
+  private activeFastWeights: PackedFastWeights | null = null;
   private activeBlob: ParsedBlob | null = null;
   private workspace: FrameWorkspace | null = null;
   private fallback2dCanvas: HTMLCanvasElement | null = null;
@@ -135,8 +157,8 @@ export class CodecSREngine {
     this.gpuInfo = gpuInfo;
 
     const srModule = device.createShaderModule({
-      label: 'client_sr_v3.wgsl',
-      code: clientSrWgsl,
+      label: 'client_sr_v3_fast.wgsl',
+      code: clientSrFastWgsl,
     });
     const colorModule = device.createShaderModule({
       label: 'color_and_compare.wgsl',
@@ -144,7 +166,7 @@ export class CodecSREngine {
     });
 
     this.srBindGroupLayout = device.createBindGroupLayout({
-      label: 'sr_bgl',
+      label: 'sr_fast_bgl',
       entries: [
         { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
         { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
@@ -153,16 +175,31 @@ export class CodecSREngine {
         {
           binding: 4,
           visibility: GPUShaderStage.COMPUTE,
-          buffer: { type: 'uniform', hasDynamicOffset: true, minBindingSize: 80 },
+          buffer: { type: 'uniform', hasDynamicOffset: true, minBindingSize: 64 },
         },
       ],
     });
 
-    this.srPipeline = device.createComputePipeline({
-      label: 'sr_compute_pipeline',
-      layout: device.createPipelineLayout({ bindGroupLayouts: [this.srBindGroupLayout] }),
-      compute: { module: srModule, entryPoint: 'main' },
-    });
+    const srLayout = device.createPipelineLayout({ bindGroupLayouts: [this.srBindGroupLayout] });
+    const mkKernel = (entryPoint: string) =>
+      device.createComputePipeline({
+        label: entryPoint,
+        layout: srLayout,
+        compute: { module: srModule, entryPoint },
+      });
+
+    this.kernels = {
+      bicubic: mkKernel('op_bicubic_main'),
+      unshuffle2_scalar: mkKernel('op_unshuffle2_scalar_main'),
+      unshuffle2_c4: mkKernel('op_unshuffle2_c4_main'),
+      conv3x3_scalar: mkKernel('op_conv3x3_scalar_to_c4_main'),
+      conv3x3_c4: mkKernel('op_conv3x3_c4_main'),
+      span_combine_c4: mkKernel('op_span_combine_c4_main'),
+      shuffle_to_scalar: mkKernel('op_shuffle_to_scalar_main'),
+      shuffle2_c4: mkKernel('op_shuffle2_c4_main'),
+      seam_lut_lr: mkKernel('op_seam_lut_lr_main'),
+      add_seam_trust_clamp: mkKernel('op_add_seam_trust_clamp_main'),
+    };
 
     this.rgb2yPipeline = device.createComputePipeline({
       label: 'rgb_to_y_pipeline',
@@ -207,7 +244,7 @@ export class CodecSREngine {
     this.paramsU32 = new Uint32Array(this.paramsStaging);
     this.paramsF32 = new Float32Array(this.paramsStaging);
     this.paramsBuf = device.createBuffer({
-      label: 'sr_dispatch_uniforms',
+      label: 'sr_fast_dispatch_uniforms',
       size: MAX_DISPATCH_SLOTS * UNIFORM_STRIDE,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
@@ -282,66 +319,121 @@ export class CodecSREngine {
 
   private bakeAndUpload(blob: ParsedBlob, prior7d: number[] | null): BakedSsboResult {
     const baked = bakeCsr1ToSsbo(blob, prior7d);
-    const neededSize = Math.max(4, baked.ssboBytes.byteLength);
+    const fast = packFastWeights(baked);
+    const neededSize = Math.max(16, fast.weightU32.byteLength);
 
     if (!this.weightBuf || this.weightBuf.size !== neededSize) {
       this.weightBuf?.destroy();
       this.weightBuf = this.device.createBuffer({
-        label: 'csr1_baked_weights',
+        label: 'csr1_fast_weights',
         size: neededSize,
         usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
       });
+      this.weightBufGeneration++;
     }
     this.device.queue.writeBuffer(
       this.weightBuf,
       0,
-      baked.ssboBytes.buffer,
-      baked.ssboBytes.byteOffset,
-      baked.ssboBytes.byteLength,
+      fast.weightU32.buffer,
+      fast.weightU32.byteOffset,
+      fast.weightU32.byteLength,
     );
     this.activeBaked = baked;
-    return baked;
+    this.activeFastWeights = fast;
+
+    // If workspace exists for same model geometry, refresh its scalar uniforms (skipAlpha/Beta/Hr/trustDelta)
+    if (this.workspace) {
+      const sig = this.getModelSignature(baked);
+      if (this.workspace.modelSignature === sig) {
+        const plan = this.buildExecutionPlan(
+          this.weightBuf,
+          baked,
+          fast,
+          this.workspace.padH,
+          this.workspace.padW,
+          this.workspace.srPadH,
+          this.workspace.srPadW,
+          this.workspace,
+        );
+        this.workspace.planSteps = plan.steps;
+        this.workspace.planSlotCount = plan.slotCount;
+        this.device.queue.writeBuffer(
+          this.paramsBuf,
+          0,
+          this.paramsStaging,
+          0,
+          plan.slotCount * UNIFORM_STRIDE,
+        );
+      } else {
+        this.workspace.modelSignature = '';
+      }
+    }
+
+    return {
+      ...baked,
+      bakeMs: baked.bakeMs + fast.packMs,
+    };
   }
 
-  private writeDispatchSlot(slot: number, spec: DispatchSpec): void {
+  private getModelSignature(baked: BakedSsboResult): string {
+    const s = baked.scalars;
+    return `${this.weightBufGeneration}:${s.tier}:${s.scale}:${s.numBody}:${s.stemCh}:${s.midCh}:${s.upOutCh}:${s.hasSeamLut}`;
+  }
+
+  private writeSlot(
+    slot: number,
+    p: {
+      inC4: number;
+      inH: number;
+      inW: number;
+      outC4: number;
+      outH: number;
+      outW: number;
+      wOff?: number;
+      bOff?: number;
+      pbOff?: number;
+      actOff?: number;
+      flags?: number;
+      scaleR?: number;
+      alpha?: number;
+      beta?: number;
+      delta?: number;
+    },
+  ): void {
     const base = (slot * UNIFORM_STRIDE) >>> 2;
-    this.paramsI32[base + 0] = spec.op;
-    this.paramsI32[base + 1] = spec.inC;
-    this.paramsI32[base + 2] = spec.inH;
-    this.paramsI32[base + 3] = spec.inW;
-    this.paramsI32[base + 4] = spec.outC;
-    this.paramsI32[base + 5] = spec.outH;
-    this.paramsI32[base + 6] = spec.outW;
-    this.paramsU32[base + 7] = spec.wOff ?? 0;
-    this.paramsU32[base + 8] = spec.bOff ?? 0;
-    this.paramsU32[base + 9] = spec.pbOff ?? 0;
-    this.paramsU32[base + 10] = spec.actOff ?? 0;
-    this.paramsI32[base + 11] = spec.hasPb ?? 0;
-    this.paramsI32[base + 12] = spec.hasAct ?? 0;
-    this.paramsI32[base + 13] = spec.scaleR ?? 1;
-    this.paramsI32[base + 14] = spec.addB ?? 0;
-    this.paramsI32[base + 15] = 0;
-    this.paramsF32[base + 16] = spec.alpha ?? 0.0;
-    this.paramsF32[base + 17] = spec.beta ?? 0.0;
-    this.paramsF32[base + 18] = spec.delta ?? 0.0;
-    this.paramsF32[base + 19] = 0.0;
+    this.paramsI32[base + 0] = p.inC4;
+    this.paramsI32[base + 1] = p.inH;
+    this.paramsI32[base + 2] = p.inW;
+    this.paramsI32[base + 3] = p.outC4;
+    this.paramsI32[base + 4] = p.outH;
+    this.paramsI32[base + 5] = p.outW;
+    this.paramsU32[base + 6] = p.wOff ?? 0;
+    this.paramsU32[base + 7] = p.bOff ?? 0;
+    this.paramsU32[base + 8] = p.pbOff ?? 0;
+    this.paramsU32[base + 9] = p.actOff ?? 0;
+    this.paramsU32[base + 10] = p.flags ?? 0;
+    this.paramsI32[base + 11] = p.scaleR ?? 1;
+    this.paramsF32[base + 12] = p.alpha ?? 0.0;
+    this.paramsF32[base + 13] = p.beta ?? 0.0;
+    this.paramsF32[base + 14] = p.delta ?? 0.0;
+    this.paramsF32[base + 15] = 0.0;
   }
 
   /**
-   * Encodes all CodecSR V3.5 compute dispatches into `encoder` matching
-   * `verify_compute_shader.py` lines 470-559 identically.
-   * Returns number of uniform slots written to `this.paramsStaging`.
+   * Pre-builds the entire SR compute execution plan (uniform slots + cached GPUBindGroups).
+   * Eliminates 100% of per-frame bindGroup creation & uniform encoding overhead!
    */
-  private encodeSrPipeline(
-    encoder: GPUCommandEncoder,
+  private buildExecutionPlan(
     weightBuf: GPUBuffer,
     baked: BakedSsboResult,
+    fast: PackedFastWeights,
     lrH: number,
     lrW: number,
     outH: number,
     outW: number,
     bufs: {
       xBuf: GPUBuffer;
+      seamLrBuf: GPUBuffer;
       baseBuf: GPUBuffer;
       resBuf: GPUBuffer;
       fHeadBuf: GPUBuffer;
@@ -350,298 +442,368 @@ export class CodecSREngine {
       pingBuf: GPUBuffer;
       pongBuf: GPUBuffer;
     },
-  ): number {
-    const offs = baked.halfOffsets;
+  ): { steps: PlanStep[]; slotCount: number } {
     const sc = baked.scalars;
     const uh = lrH >>> 1;
     const uw = lrW >>> 1;
     const rTail = Math.abs(sc.scale - 2.0) < 1e-4 ? 4 : 3;
+    const steps: PlanStep[] = [];
     let slot = 0;
 
-    const dispatch = (spec: DispatchSpec): void => {
+    const addDispatch = (
+      kernel: FastKernelKey,
+      b0: GPUBuffer,
+      b1: GPUBuffer,
+      b2: GPUBuffer,
+      b3: GPUBuffer,
+      gx: number,
+      gy: number,
+      gz: number,
+      params: Parameters<CodecSREngine['writeSlot']>[1],
+    ): void => {
       if (slot >= MAX_DISPATCH_SLOTS) {
         throw new Error(`Exceeded MAX_DISPATCH_SLOTS (${MAX_DISPATCH_SLOTS})`);
       }
-      this.writeDispatchSlot(slot, spec);
-      const bg = this.device.createBindGroup({
+      this.writeSlot(slot, params);
+      const bindGroup = this.device.createBindGroup({
         layout: this.srBindGroupLayout,
         entries: [
-          { binding: 0, resource: { buffer: weightBuf } },
-          { binding: 1, resource: { buffer: spec.bufA } },
-          { binding: 2, resource: { buffer: spec.bufB } },
-          { binding: 3, resource: { buffer: spec.dst } },
-          { binding: 4, resource: { buffer: this.paramsBuf, size: 80 } },
+          { binding: 0, resource: { buffer: b0 } },
+          { binding: 1, resource: { buffer: b1 } },
+          { binding: 2, resource: { buffer: b2 } },
+          { binding: 3, resource: { buffer: b3 } },
+          { binding: 4, resource: { buffer: this.paramsBuf, size: 64 } },
         ],
       });
-      const pass = encoder.beginComputePass();
-      pass.setPipeline(this.srPipeline);
-      pass.setBindGroup(0, bg, [slot * UNIFORM_STRIDE]);
-      pass.dispatchWorkgroups(Math.ceil(spec.outW / 16), Math.ceil(spec.outH / 16), 1);
-      pass.end();
+      steps.push({
+        kind: 'compute',
+        kernel,
+        bindGroup,
+        slotOffset: slot * UNIFORM_STRIDE,
+        gx,
+        gy,
+        gz,
+      });
       slot++;
     };
 
-    const conv = (
+    const addConv = (
       prefix: string,
-      actPrefix: string | null,
-      inC: number,
-      outC: number,
       h: number,
       w: number,
       inBuf: GPUBuffer,
       outBuf: GPUBuffer,
-      hasPb = false,
+      inIsScalar = false,
     ): void => {
-      dispatch({
-        op: 2,
-        inC,
-        inH: h,
-        inW: w,
-        outC,
-        outH: h,
-        outW: w,
-        bufA: inBuf,
-        bufB: bufs.xBuf,
-        dst: outBuf,
-        wOff: offs[`${prefix}.base.reparam_conv.weight`],
-        bOff: offs[`${prefix}.base.reparam_conv.bias`],
-        pbOff: hasPb ? offs['phase_bias'] : 0,
-        actOff: actPrefix !== null ? offs[`${actPrefix}.weight`] : 0,
-        hasPb: hasPb ? 1 : 0,
-        hasAct: actPrefix !== null ? 1 : 0,
-      });
+      const m = fast.layers[prefix];
+      const flags = (m.hasPb ? 1 : 0) | (m.hasAct ? 2 : 0);
+      addDispatch(
+        inIsScalar ? 'conv3x3_scalar' : 'conv3x3_c4',
+        weightBuf,
+        inBuf,
+        bufs.xBuf,
+        outBuf,
+        Math.ceil(w / 16),
+        Math.ceil(h / 16),
+        Math.ceil(m.outC4 / 2),
+        {
+          inC4: m.inC4,
+          inH: h,
+          inW: w,
+          outC4: m.outC4,
+          outH: h,
+          outW: w,
+          wOff: m.wOffU32,
+          bOff: m.bOffU32,
+          pbOff: m.pbOffU32,
+          actOff: m.actOffU32,
+          flags,
+        },
+      );
     };
 
     // 0. Bicubic base (Keys a = -0.75)
-    dispatch({
-      op: 0,
-      inC: 1,
-      inH: lrH,
-      inW: lrW,
-      outC: 1,
-      outH,
-      outW,
-      bufA: bufs.xBuf,
-      bufB: bufs.xBuf,
-      dst: bufs.baseBuf,
-    });
+    addDispatch(
+      'bicubic',
+      weightBuf,
+      bufs.xBuf,
+      bufs.xBuf,
+      bufs.baseBuf,
+      Math.ceil(outW / 16),
+      Math.ceil(outH / 16),
+      1,
+      { inC4: 1, inH: lrH, inW: lrW, outC4: 1, outH, outW },
+    );
 
     const midIdx = Math.floor(sc.numBody / 2);
 
     if (sc.isHourglass) {
-      const stemCh = sc.stemCh;
-      const midCh = sc.midCh;
-      conv('stem1', 'act_stem1', 1, stemCh, lrH, lrW, bufs.xBuf, bufs.pongBuf, false);
-      conv('stem2', 'act_stem2', stemCh, stemCh, lrH, lrW, bufs.pongBuf, bufs.s2Buf, false);
-      dispatch({
-        op: 1,
-        inC: stemCh,
-        inH: lrH,
-        inW: lrW,
-        outC: 4 * stemCh,
-        outH: uh,
-        outW: uw,
-        bufA: bufs.s2Buf,
-        bufB: bufs.xBuf,
-        dst: bufs.pingBuf,
-      });
-      conv('down', 'act_down', 4 * stemCh, midCh, uh, uw, bufs.pingBuf, bufs.fHeadBuf, true);
+      const stemC4 = Math.ceil(sc.stemCh / 4);
+      const midC4 = Math.ceil(sc.midCh / 4);
+
+      addConv('stem1', lrH, lrW, bufs.xBuf, bufs.pongBuf, true);
+      addConv('stem2', lrH, lrW, bufs.pongBuf, bufs.s2Buf, false);
+
+      addDispatch(
+        'unshuffle2_c4',
+        weightBuf,
+        bufs.s2Buf,
+        bufs.xBuf,
+        bufs.pingBuf,
+        Math.ceil(uw / 16),
+        Math.ceil(uh / 16),
+        stemC4,
+        { inC4: stemC4, inH: lrH, inW: lrW, outC4: stemC4 * 4, outH: uh, outW: uw },
+      );
+
+      addConv('down', uh, uw, bufs.pingBuf, bufs.fHeadBuf, false);
 
       let curIn = bufs.fHeadBuf;
       let curOut = bufs.pingBuf;
       for (let idx = 0; idx < sc.numBody; idx++) {
-        conv(`body.${idx}`, `body_acts.${idx}`, midCh, midCh, uh, uw, curIn, curOut, false);
+        addConv(`body.${idx}`, uh, uw, curIn, curOut, false);
         if (idx === midIdx) {
-          encoder.copyBufferToBuffer(curOut, 0, bufs.fMidBuf, 0, midCh * uh * uw * 4);
+          steps.push({ kind: 'copy', src: curOut, dst: bufs.fMidBuf, bytes: midC4 * 4 * uh * uw * 4 });
         }
         curIn = curOut;
         curOut = curOut === bufs.pingBuf ? bufs.pongBuf : bufs.pingBuf;
       }
 
-      dispatch({
-        op: 3,
-        inC: midCh,
-        inH: uh,
-        inW: uw,
-        outC: midCh,
-        outH: uh,
-        outW: uw,
-        bufA: bufs.fHeadBuf,
-        bufB: bufs.fMidBuf,
-        dst: curIn,
-        alpha: sc.skipAlpha,
-        beta: sc.skipBeta,
-      });
+      addDispatch(
+        'span_combine_c4',
+        weightBuf,
+        bufs.fHeadBuf,
+        bufs.fMidBuf,
+        curIn,
+        Math.ceil(uw / 16),
+        Math.ceil(uh / 16),
+        midC4,
+        {
+          inC4: midC4,
+          inH: uh,
+          inW: uw,
+          outC4: midC4,
+          outH: uh,
+          outW: uw,
+          alpha: sc.skipAlpha,
+          beta: sc.skipBeta,
+        },
+      );
 
       if (sc.hgHasUp) {
-        const upOutC = sc.upOutCh;
-        conv('up', 'act_up', midCh, upOutC, uh, uw, curIn, curOut, false);
-        dispatch({
-          op: 4,
-          inC: upOutC,
-          inH: uh,
-          inW: uw,
-          outC: stemCh,
-          outH: lrH,
-          outW: lrW,
-          bufA: curOut,
-          bufB: bufs.s2Buf,
-          dst: bufs.fHeadBuf,
-          scaleR: 2,
-          addB: 1,
-        });
-        conv('refine', 'act_refine', stemCh, stemCh, lrH, lrW, bufs.fHeadBuf, bufs.pingBuf, false);
-        conv('tail', null, stemCh, 4, lrH, lrW, bufs.pingBuf, bufs.pongBuf, false);
-        dispatch({
-          op: 4,
-          inC: 4,
-          inH: lrH,
-          inW: lrW,
-          outC: 1,
-          outH,
-          outW,
-          bufA: bufs.pongBuf,
-          bufB: bufs.xBuf,
-          dst: bufs.resBuf,
-          scaleR: 2,
-          addB: 0,
-        });
-      } else {
-        if (sc.hgHasHrSkip) {
-          dispatch({
-            op: 1,
-            inC: stemCh,
-            inH: lrH,
-            inW: lrW,
-            outC: 4 * stemCh,
-            outH: uh,
-            outW: uw,
-            bufA: bufs.s2Buf,
-            bufB: bufs.xBuf,
-            dst: curOut,
-          });
-          dispatch({
-            op: 3,
-            inC: midCh,
+        addConv('up', uh, uw, curIn, curOut, false);
+        addDispatch(
+          'shuffle2_c4',
+          weightBuf,
+          curOut,
+          bufs.s2Buf,
+          bufs.fHeadBuf,
+          Math.ceil(lrW / 16),
+          Math.ceil(lrH / 16),
+          stemC4,
+          {
+            inC4: stemC4 * 4,
             inH: uh,
             inW: uw,
-            outC: midCh,
-            outH: uh,
-            outW: uw,
-            bufA: curOut,
-            bufB: curOut,
-            dst: curIn,
-            alpha: sc.skipHr,
-            beta: 0.0,
-          });
+            outC4: stemC4,
+            outH: lrH,
+            outW: lrW,
+            scaleR: 2,
+            flags: 8, // add_b
+          },
+        );
+        addConv('refine', lrH, lrW, bufs.fHeadBuf, bufs.pingBuf, false);
+        addConv('tail', lrH, lrW, bufs.pingBuf, bufs.pongBuf, false);
+        addDispatch(
+          'shuffle_to_scalar',
+          weightBuf,
+          bufs.pongBuf,
+          bufs.xBuf,
+          bufs.resBuf,
+          Math.ceil(outW / 16),
+          Math.ceil(outH / 16),
+          1,
+          { inC4: 1, inH: lrH, inW: lrW, outC4: 1, outH, outW, scaleR: 2 },
+        );
+      } else {
+        if (sc.hgHasHrSkip) {
+          addDispatch(
+            'unshuffle2_c4',
+            weightBuf,
+            bufs.s2Buf,
+            bufs.xBuf,
+            curOut,
+            Math.ceil(uw / 16),
+            Math.ceil(uh / 16),
+            stemC4,
+            { inC4: stemC4, inH: lrH, inW: lrW, outC4: stemC4 * 4, outH: uh, outW: uw },
+          );
+          addDispatch(
+            'span_combine_c4',
+            weightBuf,
+            curOut,
+            curOut,
+            curIn,
+            Math.ceil(uw / 16),
+            Math.ceil(uh / 16),
+            midC4,
+            {
+              inC4: midC4,
+              inH: uh,
+              inW: uw,
+              outC4: midC4,
+              outH: uh,
+              outW: uw,
+              alpha: sc.skipHr,
+              beta: 0.0,
+            },
+          );
         }
-        conv('tail', null, midCh, 9, uh, uw, curIn, curOut, false);
-        dispatch({
-          op: 4,
-          inC: 9,
-          inH: uh,
-          inW: uw,
-          outC: 1,
-          outH,
-          outW,
-          bufA: curOut,
-          bufB: bufs.xBuf,
-          dst: bufs.resBuf,
-          scaleR: 3,
-          addB: 0,
-        });
+        addConv('tail', uh, uw, curIn, curOut, false);
+        addDispatch(
+          'shuffle_to_scalar',
+          weightBuf,
+          curOut,
+          bufs.xBuf,
+          bufs.resBuf,
+          Math.ceil(outW / 16),
+          Math.ceil(outH / 16),
+          1,
+          { inC4: 3, inH: uh, inW: uw, outC4: 1, outH, outW, scaleR: 3 },
+        );
       }
     } else {
-      const midCh = sc.midCh;
-      dispatch({
-        op: 1,
-        inC: 1,
-        inH: lrH,
-        inW: lrW,
-        outC: 4,
-        outH: uh,
-        outW: uw,
-        bufA: bufs.xBuf,
-        bufB: bufs.xBuf,
-        dst: bufs.pingBuf,
-      });
-      conv('head', 'act_head', 4, midCh, uh, uw, bufs.pingBuf, bufs.fHeadBuf, true);
+      const midC4 = Math.ceil(sc.midCh / 4);
+      addDispatch(
+        'unshuffle2_scalar',
+        weightBuf,
+        bufs.xBuf,
+        bufs.xBuf,
+        bufs.pingBuf,
+        Math.ceil(uw / 16),
+        Math.ceil(uh / 16),
+        1,
+        { inC4: 1, inH: lrH, inW: lrW, outC4: 1, outH: uh, outW: uw },
+      );
+
+      addConv('head', uh, uw, bufs.pingBuf, bufs.fHeadBuf, false);
 
       let curIn = bufs.fHeadBuf;
       let curOut = bufs.pingBuf;
       for (let idx = 0; idx < sc.numBody; idx++) {
-        conv(`body.${idx}`, `body_acts.${idx}`, midCh, midCh, uh, uw, curIn, curOut, false);
+        addConv(`body.${idx}`, uh, uw, curIn, curOut, false);
         if (idx === midIdx) {
-          encoder.copyBufferToBuffer(curOut, 0, bufs.fMidBuf, 0, midCh * uh * uw * 4);
+          steps.push({ kind: 'copy', src: curOut, dst: bufs.fMidBuf, bytes: midC4 * 4 * uh * uw * 4 });
         }
         curIn = curOut;
         curOut = curOut === bufs.pingBuf ? bufs.pongBuf : bufs.pingBuf;
       }
 
-      dispatch({
-        op: 3,
-        inC: midCh,
-        inH: uh,
-        inW: uw,
-        outC: midCh,
-        outH: uh,
-        outW: uw,
-        bufA: bufs.fHeadBuf,
-        bufB: bufs.fMidBuf,
-        dst: curIn,
-        alpha: sc.skipAlpha,
-        beta: sc.skipBeta,
-      });
+      addDispatch(
+        'span_combine_c4',
+        weightBuf,
+        bufs.fHeadBuf,
+        bufs.fMidBuf,
+        curIn,
+        Math.ceil(uw / 16),
+        Math.ceil(uh / 16),
+        midC4,
+        {
+          inC4: midC4,
+          inH: uh,
+          inW: uw,
+          outC4: midC4,
+          outH: uh,
+          outW: uw,
+          alpha: sc.skipAlpha,
+          beta: sc.skipBeta,
+        },
+      );
 
-      conv('tail', null, midCh, rTail * rTail, uh, uw, curIn, curOut, false);
-      dispatch({
-        op: 4,
-        inC: rTail * rTail,
-        inH: uh,
-        inW: uw,
-        outC: 1,
-        outH,
-        outW,
-        bufA: curOut,
-        bufB: bufs.xBuf,
-        dst: bufs.resBuf,
-        scaleR: rTail,
-        addB: 0,
-      });
+      addConv('tail', uh, uw, curIn, curOut, false);
+      addDispatch(
+        'shuffle_to_scalar',
+        weightBuf,
+        curOut,
+        bufs.xBuf,
+        bufs.resBuf,
+        Math.ceil(outW / 16),
+        Math.ceil(outH / 16),
+        1,
+        {
+          inC4: Math.ceil((rTail * rTail) / 4),
+          inH: uh,
+          inW: uw,
+          outC4: 1,
+          outH,
+          outW,
+          scaleR: rTail,
+        },
+      );
     }
 
-    if (sc.hasSeamLut && offs['seam_lut.table'] !== undefined) {
-      dispatch({
-        op: 5,
-        inC: 1,
+    // Optional Seam3DLUT computed ONCE at LR resolution
+    const hasSeam = sc.hasSeamLut && baked.halfOffsets['seam_lut.table'] !== undefined;
+    if (hasSeam) {
+      addDispatch(
+        'seam_lut_lr',
+        weightBuf,
+        bufs.xBuf,
+        bufs.xBuf,
+        bufs.seamLrBuf,
+        Math.ceil(lrW / 16),
+        Math.ceil(lrH / 16),
+        1,
+        {
+          inC4: 1,
+          inH: lrH,
+          inW: lrW,
+          outC4: 1,
+          outH: lrH,
+          outW: lrW,
+          wOff: fast.seamTableOffU32,
+          bOff: fast.seamMaskOffU32,
+        },
+      );
+    }
+
+    // Final fused pass: Residual + Bilinear(SeamLUT_LR) + Bicubic Base + 3x3 TrustClamp
+    addDispatch(
+      'add_seam_trust_clamp',
+      bufs.seamLrBuf,
+      bufs.baseBuf,
+      bufs.xBuf,
+      bufs.resBuf,
+      Math.ceil(outW / 16),
+      Math.ceil(outH / 16),
+      1,
+      {
+        inC4: 1,
         inH: lrH,
         inW: lrW,
-        outC: 1,
+        outC4: 1,
         outH,
         outW,
-        bufA: bufs.xBuf,
-        bufB: bufs.xBuf,
-        dst: bufs.resBuf,
-        wOff: offs['seam_lut.table'],
-        bOff: offs['seam_lut.seam_mask'],
-      });
+        flags: hasSeam ? 16 : 0,
+        delta: sc.trustDelta,
+      },
+    );
+
+    return { steps, slotCount: slot };
+  }
+
+  private encodePlanSteps(encoder: GPUCommandEncoder, steps: PlanStep[]): void {
+    for (const step of steps) {
+      if (step.kind === 'copy') {
+        encoder.copyBufferToBuffer(step.src, 0, step.dst, 0, step.bytes);
+      } else {
+        const pass = encoder.beginComputePass();
+        pass.setPipeline(this.kernels[step.kernel]);
+        pass.setBindGroup(0, step.bindGroup, [step.slotOffset]);
+        pass.dispatchWorkgroups(step.gx, step.gy, step.gz);
+        pass.end();
+      }
     }
-
-    dispatch({
-      op: 6,
-      inC: 1,
-      inH: lrH,
-      inW: lrW,
-      outC: 1,
-      outH,
-      outW,
-      bufA: bufs.baseBuf,
-      bufB: bufs.xBuf,
-      dst: bufs.resBuf,
-      delta: sc.trustDelta,
-    });
-
-    return slot;
   }
 
   /**
@@ -653,20 +815,21 @@ export class CodecSREngine {
     lrW: number,
     baked: BakedSsboResult,
   ): Promise<Float32Array> {
+    const fast = packFastWeights(baked);
     const outH = Math.round(lrH * baked.scalars.scale);
     const outW = Math.round(lrW * baked.scalars.scale);
     const scratchBytes = computeRequiredScratchBytes(lrH, lrW, outH, outW, baked);
 
     const wBuf = this.device.createBuffer({
-      size: Math.max(4, baked.ssboBytes.byteLength),
+      size: Math.max(16, fast.weightU32.byteLength),
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
     });
     this.device.queue.writeBuffer(
       wBuf,
       0,
-      baked.ssboBytes.buffer,
-      baked.ssboBytes.byteOffset,
-      baked.ssboBytes.byteLength,
+      fast.weightU32.buffer,
+      fast.weightU32.byteOffset,
+      fast.weightU32.byteLength,
     );
 
     const xBuf = this.device.createBuffer({
@@ -681,12 +844,13 @@ export class CodecSREngine {
       inputF32.byteLength,
     );
 
-    const makeBuf = (size: number, extra = 0) =>
+    const makeBuf = (size: number) =>
       this.device.createBuffer({
-        size,
-        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST | extra,
+        size: Math.max(16, size),
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
       });
 
+    const seamLrBuf = makeBuf(lrH * lrW * 4);
     const baseBuf = makeBuf(outH * outW * 4);
     const resBuf = makeBuf(outH * outW * 4);
     const fHeadBuf = makeBuf(scratchBytes);
@@ -700,9 +864,9 @@ export class CodecSREngine {
     });
 
     try {
-      const encoder = this.device.createCommandEncoder();
-      const slots = this.encodeSrPipeline(encoder, wBuf, baked, lrH, lrW, outH, outW, {
+      const plan = this.buildExecutionPlan(wBuf, baked, fast, lrH, lrW, outH, outW, {
         xBuf,
+        seamLrBuf,
         baseBuf,
         resBuf,
         fHeadBuf,
@@ -711,9 +875,18 @@ export class CodecSREngine {
         pingBuf,
         pongBuf,
       });
-      encoder.copyBufferToBuffer(resBuf, 0, readbackBuf, 0, outH * outW * 4);
 
-      this.device.queue.writeBuffer(this.paramsBuf, 0, this.paramsStaging, 0, slots * UNIFORM_STRIDE);
+      this.device.queue.writeBuffer(
+        this.paramsBuf,
+        0,
+        this.paramsStaging,
+        0,
+        plan.slotCount * UNIFORM_STRIDE,
+      );
+
+      const encoder = this.device.createCommandEncoder();
+      this.encodePlanSteps(encoder, plan.steps);
+      encoder.copyBufferToBuffer(resBuf, 0, readbackBuf, 0, outH * outW * 4);
       this.device.queue.submit([encoder.finish()]);
 
       await readbackBuf.mapAsync(GPUMapMode.READ);
@@ -721,8 +894,32 @@ export class CodecSREngine {
       readbackBuf.unmap();
       return copy;
     } finally {
+      // Restore active workspace uniform buffer if one exists
+      if (this.workspace && this.activeBaked && this.activeFastWeights && this.weightBuf) {
+        const restored = this.buildExecutionPlan(
+          this.weightBuf,
+          this.activeBaked,
+          this.activeFastWeights,
+          this.workspace.padH,
+          this.workspace.padW,
+          this.workspace.srPadH,
+          this.workspace.srPadW,
+          this.workspace,
+        );
+        this.workspace.planSteps = restored.steps;
+        this.workspace.planSlotCount = restored.slotCount;
+        this.device.queue.writeBuffer(
+          this.paramsBuf,
+          0,
+          this.paramsStaging,
+          0,
+          restored.slotCount * UNIFORM_STRIDE,
+        );
+      }
+
       wBuf.destroy();
       xBuf.destroy();
+      seamLrBuf.destroy();
       baseBuf.destroy();
       resBuf.destroy();
       fHeadBuf.destroy();
@@ -734,7 +931,12 @@ export class CodecSREngine {
     }
   }
 
-  private ensureWorkspace(srcW: number, srcH: number, baked: BakedSsboResult): FrameWorkspace {
+  private ensureWorkspace(
+    srcW: number,
+    srcH: number,
+    baked: BakedSsboResult,
+    fast: PackedFastWeights,
+  ): FrameWorkspace {
     const padW = srcW + (srcW & 1);
     const padH = srcH + (srcH & 1);
     const srPadW = Math.round(padW * baked.scalars.scale);
@@ -742,6 +944,7 @@ export class CodecSREngine {
     const outW = Math.round(srcW * baked.scalars.scale);
     const outH = Math.round(srcH * baked.scalars.scale);
     const scratchBytes = computeRequiredScratchBytes(padH, padW, srPadH, srPadW, baked);
+    const sig = this.getModelSignature(baked);
 
     if (
       this.workspace &&
@@ -751,6 +954,28 @@ export class CodecSREngine {
       this.workspace.outH === outH &&
       this.workspace.scratchBytes >= scratchBytes
     ) {
+      if (this.workspace.modelSignature !== sig && this.weightBuf) {
+        const plan = this.buildExecutionPlan(
+          this.weightBuf,
+          baked,
+          fast,
+          padH,
+          padW,
+          srPadH,
+          srPadW,
+          this.workspace,
+        );
+        this.workspace.planSteps = plan.steps;
+        this.workspace.planSlotCount = plan.slotCount;
+        this.workspace.modelSignature = sig;
+        this.device.queue.writeBuffer(
+          this.paramsBuf,
+          0,
+          this.paramsStaging,
+          0,
+          plan.slotCount * UNIFORM_STRIDE,
+        );
+      }
       return this.workspace;
     }
 
@@ -793,11 +1018,12 @@ export class CodecSREngine {
     const mkBuf = (label: string, size: number) =>
       this.device.createBuffer({
         label,
-        size,
+        size: Math.max(16, size),
         usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
       });
 
     const xBuf = mkBuf('x_luma', padW * padH * 4);
+    const seamLrBuf = mkBuf('seam_lr', padW * padH * 4);
     const baseBuf = mkBuf('base_bicubic_luma', srPadW * srPadH * 4);
     const resBuf = mkBuf('res_sr_luma', srPadW * srPadH * 4);
     const fHeadBuf = mkBuf('f_head', scratchBytes);
@@ -849,6 +1075,45 @@ export class CodecSREngine {
       ],
     });
 
+    const displayLinearBindGroup = this.device.createBindGroup({
+      layout: this.displayPipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: srTex.createView() },
+        { binding: 1, resource: bicubicTex.createView() },
+        { binding: 2, resource: this.linearSampler },
+        { binding: 3, resource: { buffer: this.displayUniformBuf } },
+      ],
+    });
+
+    const displayNearestBindGroup = this.device.createBindGroup({
+      layout: this.displayPipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: srTex.createView() },
+        { binding: 1, resource: bicubicTex.createView() },
+        { binding: 2, resource: this.nearestSampler },
+        { binding: 3, resource: { buffer: this.displayUniformBuf } },
+      ],
+    });
+
+    const plan = this.buildExecutionPlan(this.weightBuf!, baked, fast, padH, padW, srPadH, srPadW, {
+      xBuf,
+      seamLrBuf,
+      baseBuf,
+      resBuf,
+      fHeadBuf,
+      fMidBuf,
+      s2Buf,
+      pingBuf,
+      pongBuf,
+    });
+    this.device.queue.writeBuffer(
+      this.paramsBuf,
+      0,
+      this.paramsStaging,
+      0,
+      plan.slotCount * UNIFORM_STRIDE,
+    );
+
     this.workspace = {
       srcW,
       srcH,
@@ -859,10 +1124,12 @@ export class CodecSREngine {
       outW,
       outH,
       scratchBytes,
+      modelSignature: sig,
       srcTex,
       srTex,
       bicubicTex,
       xBuf,
+      seamLrBuf,
       baseBuf,
       resBuf,
       fHeadBuf,
@@ -875,6 +1142,10 @@ export class CodecSREngine {
       rgb2yBindGroup,
       y2rgbSrBindGroup,
       y2rgbBiBindGroup,
+      displayLinearBindGroup,
+      displayNearestBindGroup,
+      planSteps: plan.steps,
+      planSlotCount: plan.slotCount,
     };
     return this.workspace;
   }
@@ -892,8 +1163,6 @@ export class CodecSREngine {
         [srcW, srcH, 1],
       );
     } catch (err) {
-      // Chromium can transiently reject paused/offscreen HTMLVideoElement before compositor backing exists.
-      // Fall back transparently via a reusable 2D staging canvas so frame 0 / seeked frames always render.
       if (typeof HTMLVideoElement !== 'undefined' && source instanceof HTMLVideoElement) {
         if (!this.fallback2dCanvas) {
           this.fallback2dCanvas = document.createElement('canvas');
@@ -918,18 +1187,20 @@ export class CodecSREngine {
   }
 
   /**
-   * Uploads one video frame, runs full CodecSR V3.5 WebGPU inference, and writes SR (+ optional Bicubic) RGBA textures.
+   * Uploads one video frame, runs the tiled C4 WebGPU SR pipeline with ZERO per-frame
+   * bindGroup allocations, and optionally renders directly to `renderTargetCtx` in the SAME submit!
    */
   processFrame(
     source: GPUCopyExternalImageSource,
     srcW: number,
     srcH: number,
     includeBicubic = true,
+    renderTarget?: { ctx: GPUCanvasContext; opts: DisplayOptions },
   ): { outW: number; outH: number } {
-    if (!this.activeBaked || !this.weightBuf) {
+    if (!this.activeBaked || !this.activeFastWeights || !this.weightBuf) {
       throw new Error('模型尚未初始化');
     }
-    const ws = this.ensureWorkspace(srcW, srcH, this.activeBaked);
+    const ws = this.ensureWorkspace(srcW, srcH, this.activeBaked, this.activeFastWeights);
 
     this.uploadExternalSource(source, ws.srcTex, srcW, srcH);
 
@@ -944,26 +1215,8 @@ export class CodecSREngine {
       pass.end();
     }
 
-    // 2. CodecSR V3.5 super-resolution (computes baseBuf=bicubic Y and resBuf=SR Y)
-    const slots = this.encodeSrPipeline(
-      encoder,
-      this.weightBuf,
-      this.activeBaked,
-      ws.padH,
-      ws.padW,
-      ws.srPadH,
-      ws.srPadW,
-      {
-        xBuf: ws.xBuf,
-        baseBuf: ws.baseBuf,
-        resBuf: ws.resBuf,
-        fHeadBuf: ws.fHeadBuf,
-        fMidBuf: ws.fMidBuf,
-        s2Buf: ws.s2Buf,
-        pingBuf: ws.pingBuf,
-        pongBuf: ws.pongBuf,
-      },
-    );
+    // 2. Cached high-performance CodecSR V3.5 execution plan
+    this.encodePlanSteps(encoder, ws.planSteps);
 
     // 3. Y_sr + upsampled CbCr -> RGBA
     {
@@ -974,7 +1227,7 @@ export class CodecSREngine {
       pass.end();
     }
 
-    // 4. Optional Y_bicubic + upsampled CbCr -> RGBA (for split-screen & heatmap comparison)
+    // 4. Optional Y_bicubic + upsampled CbCr -> RGBA
     if (includeBicubic) {
       const pass = encoder.beginComputePass();
       pass.setPipeline(this.y2rgbPipeline);
@@ -983,23 +1236,35 @@ export class CodecSREngine {
       pass.end();
     }
 
-    this.device.queue.writeBuffer(this.paramsBuf, 0, this.paramsStaging, 0, slots * UNIFORM_STRIDE);
-    this.device.queue.submit([encoder.finish()]);
+    // 5. Optional fused display render pass in the SAME command buffer (zero extra submit!)
+    if (renderTarget) {
+      this.writeDisplayUniforms(renderTarget.opts);
+      const pass = encoder.beginRenderPass({
+        colorAttachments: [
+          {
+            view: renderTarget.ctx.getCurrentTexture().createView(),
+            loadOp: 'clear',
+            storeOp: 'store',
+            clearValue: { r: 0.035, g: 0.043, b: 0.063, a: 1.0 },
+          },
+        ],
+      });
+      pass.setPipeline(this.displayPipeline);
+      pass.setBindGroup(
+        0,
+        renderTarget.opts.zoom >= 2.0 ? ws.displayNearestBindGroup : ws.displayLinearBindGroup,
+      );
+      pass.draw(3, 1, 0, 0);
+      pass.end();
+    }
 
+    this.device.queue.submit([encoder.finish()]);
     return { outW: ws.outW, outH: ws.outH };
   }
 
-  /**
-   * Renders the most recently processed SR & Bicubic textures onto a WebGPU canvas context.
-   * Zero re-inference when dragging the split slider or inspecting zoomed regions.
-   */
-  renderToCanvas(ctx: GPUCanvasContext, opts: DisplayOptions): void {
-    const ws = this.workspace;
-    if (!ws) return;
-
-    const uBuf = new ArrayBuffer(32);
-    const f32 = new Float32Array(uBuf);
-    const u32 = new Uint32Array(uBuf);
+  private writeDisplayUniforms(opts: DisplayOptions): void {
+    const f32 = new Float32Array(this.displayUniformStaging);
+    const u32 = new Uint32Array(this.displayUniformStaging);
     f32[0] = opts.splitX;
     u32[1] = opts.viewMode;
     f32[2] = opts.zoom;
@@ -1008,19 +1273,18 @@ export class CodecSREngine {
     f32[5] = opts.centerY;
     f32[6] = 0;
     f32[7] = 0;
-    this.device.queue.writeBuffer(this.displayUniformBuf, 0, uBuf);
+    this.device.queue.writeBuffer(this.displayUniformBuf, 0, this.displayUniformStaging);
+  }
 
-    const sampler = opts.zoom >= 2.0 ? this.nearestSampler : this.linearSampler;
-    const bg = this.device.createBindGroup({
-      layout: this.displayPipeline.getBindGroupLayout(0),
-      entries: [
-        { binding: 0, resource: ws.srTex.createView() },
-        { binding: 1, resource: ws.bicubicTex.createView() },
-        { binding: 2, resource: sampler },
-        { binding: 3, resource: { buffer: this.displayUniformBuf } },
-      ],
-    });
+  /**
+   * Renders the most recently processed SR & Bicubic textures onto a WebGPU canvas context.
+   * Zero re-inference and zero bindGroup allocation when dragging the split slider or zooming!
+   */
+  renderToCanvas(ctx: GPUCanvasContext, opts: DisplayOptions): void {
+    const ws = this.workspace;
+    if (!ws) return;
 
+    this.writeDisplayUniforms(opts);
     const encoder = this.device.createCommandEncoder();
     const pass = encoder.beginRenderPass({
       colorAttachments: [
@@ -1033,13 +1297,12 @@ export class CodecSREngine {
       ],
     });
     pass.setPipeline(this.displayPipeline);
-    pass.setBindGroup(0, bg);
+    pass.setBindGroup(0, opts.zoom >= 2.0 ? ws.displayNearestBindGroup : ws.displayLinearBindGroup);
     pass.draw(3, 1, 0, 0);
     pass.end();
     this.device.queue.submit([encoder.finish()]);
   }
 
-  /** Wait until GPU finishes all submitted work (used for accurate latency telemetry / export pacing). */
   async waitGpuIdle(): Promise<void> {
     await this.device.queue.onSubmittedWorkDone();
   }
@@ -1051,6 +1314,7 @@ export class CodecSREngine {
     ws.srTex.destroy();
     ws.bicubicTex.destroy();
     ws.xBuf.destroy();
+    ws.seamLrBuf.destroy();
     ws.baseBuf.destroy();
     ws.resBuf.destroy();
     ws.fHeadBuf.destroy();
